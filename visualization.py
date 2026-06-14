@@ -174,22 +174,36 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
             x, y = zone.exterior.xy
             fig.add_trace(go.Scatter(x=list(x), y=list(y), fill='toself', fillcolor='rgba(255, 215, 0, 0.45)', line=dict(color='goldenrod', width=1), name="Non-buildable", hoverinfo='skip'))
 
-    colors = px.colors.qualitative.Plotly
-    mvs_map = {id(m): f"M{i+1}" for i, m in enumerate(mvs_list)}
-    
     for i, mvs in enumerate(mvs_list):
-        col = colors[i % len(colors)]
         mvs_id = mvs.get("id", f"M{i+1}")
+        
+        # MVS Clearance Shadow
+        if "clearance_zone" in mvs and not mvs["clearance_zone"].is_empty:
+            cx, cy = mvs["clearance_zone"].exterior.xy
+            fig.add_trace(go.Scatter(
+                x=list(cx), y=list(cy), fill='toself', fillcolor='rgba(150, 150, 150, 0.1)', 
+                line=dict(color='rgba(150, 150, 150, 0.5)', width=1, dash='dash'), 
+                hoverinfo='skip', showlegend=False
+            ))
         
         # BESS and cables
         for j, bess in enumerate(mvs["assigned_bess"]):
             bess_id = bess.get("id", f"B{j+1}_(M{i+1})")
             
+            # BESS Clearance Shadow
+            if "clearance_zone" in bess and not bess["clearance_zone"].is_empty:
+                cx, cy = bess["clearance_zone"].exterior.xy
+                fig.add_trace(go.Scatter(
+                    x=list(cx), y=list(cy), fill='toself', fillcolor='rgba(150, 150, 150, 0.1)', 
+                    line=dict(color='rgba(150, 150, 150, 0.5)', width=1, dash='dash'), 
+                    hoverinfo='skip', showlegend=False
+                ))
+            
             # Cable
             fig.add_trace(go.Scatter(
                 x=[bess["footprint"].centroid.x, mvs["footprint"].centroid.x],
                 y=[bess["footprint"].centroid.y, mvs["footprint"].centroid.y],
-                mode='lines', line=dict(color=col, width=1.5), opacity=0.7, showlegend=False, hoverinfo='skip'
+                mode='lines', line=dict(color='#757575', width=1.5), opacity=0.7, showlegend=False, hoverinfo='skip'
             ))
             
             # BESS Footprint
@@ -198,8 +212,8 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
             hover_text = f"ID: {bess_id}<br>Type: BESS<br>X: {bess['footprint'].bounds[0]:.1f}<br>Y: {bess['footprint'].bounds[1]:.1f}<br>Rotated: {rot_str}<br>Assigned MVS: {mvs_id}"
             
             fig.add_trace(go.Scatter(
-                x=list(bx), y=list(by), fill='toself', fillcolor=col, opacity=0.8, line=dict(color='black', width=1),
-                name=f"BESS ({mvs_id})", text=hover_text, hoverinfo='text', showlegend=False
+                x=list(bx), y=list(by), fill='toself', fillcolor='#0D47A1', opacity=0.9, line=dict(color='#90CAF9', width=1.5),
+                name=f"BESS ({mvs_id})", text=hover_text, hoverinfo='text', showlegend=False, customdata=[bess_id]*len(bx)
             ))
             
         # MVS Footprint
@@ -208,8 +222,8 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
         hover_text = f"ID: {mvs_id}<br>Type: MVS<br>X: {mvs['footprint'].bounds[0]:.1f}<br>Y: {mvs['footprint'].bounds[1]:.1f}<br>Rotated: {rot_str}<br>Assigned BESS: {len(mvs['assigned_bess'])}"
         
         fig.add_trace(go.Scatter(
-            x=list(mx), y=list(my), fill='toself', fillcolor=col, opacity=1.0, line=dict(color='black', width=2),
-            name=f"MVS {mvs_id}", text=hover_text, hoverinfo='text'
+            x=list(mx), y=list(my), fill='toself', fillcolor='#E65100', opacity=1.0, line=dict(color='black', width=2),
+            name=f"MVS {mvs_id}", text=hover_text, hoverinfo='text', customdata=[mvs_id]*len(mx)
         ))
         
     fig.update_layout(
