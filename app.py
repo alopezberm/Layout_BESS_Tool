@@ -17,6 +17,17 @@ from visualization import plot_layout_plotly
 
 st.set_page_config(page_title="BESS-Opt Engine", layout="wide")
 
+st.markdown("""
+<style>
+[data-testid="stMetricValue"] {
+    font-size: 1.5rem !important;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 0.9rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Initialize session state cache
 if "baseline_cache" not in st.session_state:
     st.session_state["baseline_cache"] = {}
@@ -167,7 +178,7 @@ with st.sidebar:
 
     st.subheader("Commercial Equipment Scaling")
     bess_cap = st.slider("BESS Unit Capacity (MWh)", 0.0, 15.0, 5.0, 0.5)
-    mvs_pow = st.slider("MVS Station Power (MW)", 0.0, 10.0, 2.5, 0.5)
+    mvs_pow = st.slider("MVS Station Power (MW)", 0.0, 15.0, 2.5, 0.5)
 
 CONFIG = {
     "site_vertices": site_vertices,
@@ -225,7 +236,8 @@ with col_chart:
     for err in placement_errors:
         st.error(err)
     fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, CONFIG, title=f"BESS Layout ({mode.replace('_', ' ').title()})")
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(dragmode='pan')
+    st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
 with col_data:
     st.markdown("### Live Performance Metrics")
@@ -245,6 +257,30 @@ with col_data:
 
     st.markdown("### Interactive Data Sandbox")
     st.markdown("Modify coordinates, rotate units, reassign networks, or add/delete rows.")
+
+    # Quick Action Buttons
+    action_col1, action_col2, action_col3 = st.columns(3)
+    
+    if action_col1.button("➕ Add BESS Container"):
+        new_row = pd.DataFrame([{
+            "ID": f"B_NEW_{len(editor_df)}", "Type": "BESS", "X": 25.0, "Y": 45.0, 
+            "Rotated": False, "Assigned_MVS": "M1"
+        }])
+        st.session_state["editor_df"] = pd.concat([editor_df, new_row], ignore_index=True)
+        st.rerun()
+        
+    if action_col2.button("⚡ Add MVS Station"):
+        new_row = pd.DataFrame([{
+            "ID": f"M_NEW_{len(editor_df)}", "Type": "MVS", "X": 25.0, "Y": 45.0, 
+            "Rotated": False, "Assigned_MVS": None
+        }])
+        st.session_state["editor_df"] = pd.concat([editor_df, new_row], ignore_index=True)
+        st.rerun()
+        
+    if action_col3.button("🗑️ Clear All Overrides"):
+        st.session_state["editor_df"] = st.session_state["baseline_cache"][cache_key].copy()
+        st.rerun()
+
     new_edited_df = st.data_editor(editor_df, num_rows="dynamic", use_container_width=True)
     
     if not new_edited_df.equals(editor_df):
