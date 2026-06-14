@@ -1,107 +1,182 @@
 # BESS Layout Optimization Tool
 
-A Python-based spatial optimization engine for Battery Energy Storage System (BESS) site layouts. Given an arbitrary site polygon, it automatically maximizes the number of battery containers placed while respecting equipment footprints, asymmetric clearance zones, non-buildable areas, and MVS/PCS capacity constraints.
+> Automated spatial layout engine for Battery Energy Storage System sites — maximizes battery count on any polygon site while respecting clearances, exclusion zones, and MVS capacity constraints.
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)
-![Jupyter](https://img.shields.io/badge/Jupyter-Notebook-orange?logo=jupyter)
-![Shapely](https://img.shields.io/badge/Shapely-2.x-green)
-![NumPy](https://img.shields.io/badge/NumPy-2.x-013243?logo=numpy)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
+![Jupyter](https://img.shields.io/badge/Jupyter-Notebook-F37626?logo=jupyter&logoColor=white)
+![Shapely](https://img.shields.io/badge/Shapely-2.x-4CAF50?logo=python&logoColor=white)
+![NumPy](https://img.shields.io/badge/NumPy-2.x-013243?logo=numpy&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+
+<!-- Replace the line below with your actual screenshot once you export one:
+     plt.savefig("docs/layout.png", dpi=150, bbox_inches="tight")
+-->
+> **Screenshot:** run the notebook and export your layout to add an image here.
+
+---
+
+## What it does
+
+Given a site boundary and a set of constraints, the optimizer automatically determines how to fit the maximum number of BESS containers into the buildable area, grouped into clusters around MVS/PCS inverter units.
+
+It is intended for **early-stage feasibility studies and proposal layouts** — fast iteration over different site configurations matters more than a provably optimal solution at this stage.
+
+```
+Input                              Output
+─────                              ──────
+Site polygon vertices        →     Cluster count
+Non-buildable zones               BESS count
+Restricted zones                  Saturation rate
+Equipment dimensions              Total cable length
+Clearance requirements            2D layout plot
+MVS capacity
+```
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Adapting to a New Site](#adapting-to-a-new-site)
 - [Configuration Reference](#configuration-reference)
-- [Algorithm](#algorithm)
+- [How the Algorithm Works](#how-the-algorithm-works)
 - [Output](#output)
-- [Project Structure](#project-structure)
-
----
-
-## Overview
-
-Sizing and arranging BESS containers on a constrained site is a time-consuming task during the development phase of an energy storage project. This tool automates the spatial layout step: you define the site boundary, exclusion zones, equipment specs, and clustering rules — and the optimizer fills the site with as many battery containers as possible.
-
-It is designed to support **early-stage feasibility studies and proposal layouts**, where quick iteration over different site configurations is more valuable than an exact optimal solution.
+- [Limitations](#limitations)
+- [Roadmap](#roadmap)
+- [License](#license)
 
 ---
 
 ## Features
 
-- **Arbitrary site polygon** — define any convex or non-convex boundary using a list of (x, y) vertices
-- **Two zone types** — *non-buildable* zones (cable corridors, fire lanes) block placement but remain inside the site; *restricted* zones (out-of-scope areas) are fully subtracted from the usable area
-- **Asymmetric clearance per equipment side** — front / back / left / right clearances modelled independently; clearance zones may overlap each other but not equipment footprints
-- **Interleaved greedy placement** — places one MVS and immediately fills its BESS cluster before moving to the next, preventing the optimizer from depleting battery space with inverter units
-- **Compact cluster scoring** — each successive BESS in a cluster is scored by distance to MVS plus a compactness term, naturally forming row-like clusters rather than scattered arrangements
-- **Cable crossing toggle** — `AVOID_CABLE_CROSSINGS = False` maximises battery count; `True` performs a Voronoi reassignment pass that eliminates inter-cluster cable crossings at no physical rearrangement cost
-- **Site setback** — optional inward buffer on the site boundary
-- **Colour-coded visualization** — each cluster rendered in a distinct colour with footprints, clearance zones, cable runs, and a summary title
+| | |
+|---|---|
+| Arbitrary site polygon | Any convex or non-convex boundary defined by (x, y) vertex lists |
+| Two zone types | *Non-buildable* (cable corridors, fire lanes) block placement but stay inside the site; *restricted* zones are subtracted from the usable area entirely |
+| Asymmetric clearances | Independent front / back / left / right distances per equipment type; clearance zones may overlap each other but never equipment footprints |
+| Interleaved placement | One MVS placed, then its full BESS cluster filled, before the next MVS — prevents inverters from depleting battery space |
+| Compact cluster scoring | Each BESS slot is scored by `dist_to_MVS + 0.5 × dist_to_nearest_cluster_member`, pulling successive units into tight rows |
+| Cable crossing control | Single boolean toggle: greedy fill (max BESS) vs. Voronoi reassignment (no inter-cluster crossings) |
+| Site setback | Optional inward buffer on the site boundary |
+| Colour-coded plot | One colour per cluster; footprints, clearance zones, cable runs, and a metric summary in the title |
 
 ---
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.9 or later
-- Jupyter Notebook or JupyterLab
-
-### Install dependencies
+**Requirements:** Python 3.9+, Jupyter Notebook or JupyterLab.
 
 ```bash
-pip install shapely matplotlib numpy
-```
-
-Or run the first cell of the notebook, which installs everything automatically.
-
-### Clone the repository
-
-```bash
+# 1. Clone
 git clone https://github.com/<your-username>/Layout_BESS_Tool.git
 cd Layout_BESS_Tool
+
+# 2. Install dependencies
+pip install shapely matplotlib numpy
+
+# 3. Launch
 jupyter notebook Layout.ipynb
 ```
+
+The notebook's first cell also runs `pip install` automatically if you prefer not to install manually.
 
 ---
 
 ## Quick Start
 
-1. Open `Layout.ipynb` in Jupyter.
-2. Edit the **KEY INPUTS** cell with your site geometry and equipment specs.
-3. Run all cells (`Kernel → Restart & Run All`).
-4. The final cell produces a results summary and a 2D layout plot.
+1. Open `Layout.ipynb`.
+2. Edit the **ZONE DEFINITIONS** cell — define your site polygon, non-buildable areas, and restricted areas as vertex lists.
+3. Edit the **KEY INPUTS** cell — set container dimensions, clearances, and system constraints.
+4. Run all cells (`Kernel → Restart & Run All`).
+
+The last cell prints a results table and renders the layout plot.
+
+---
+
+## Adapting to a New Site
+
+### Step 1 — Trace the site boundary
+
+Define the usable perimeter as an ordered list of (x, y) vertices in metres (counter-clockwise or clockwise, Shapely accepts both):
+
+```python
+"site_vertices": [
+    (0,    0),
+    (80,   0),
+    (80,  120),
+    (0,  120),
+]
+```
+
+### Step 2 — Define exclusion zones
+
+```python
+# Non-buildable: stays inside the site polygon, blocks placement
+#   (cable trenches, fire lanes, access roads)
+cable_corridor = [
+    (20,  0),
+    (30,  0),
+    (30, 120),
+    (20, 120),
+]
+
+# Restricted: completely removed from the site
+#   (third-party land, environmental exclusions)
+out_of_scope = [
+    (60, 80),
+    (80, 80),
+    (80, 120),
+    (60, 120),
+]
+```
+
+Then wire them into `CONFIG`:
+
+```python
+"zones": {
+    "non_buildable": [cable_corridor],   # list of polygons
+    "restricted":    [out_of_scope],
+}
+```
+
+### Step 3 — Set equipment specs and run
+
+Adjust `BESS_WIDTH`, `BESS_HEIGHT`, clearances, and `MAX_BESS_PER_MVS` in **KEY INPUTS**, then re-run all cells.
 
 ---
 
 ## Configuration Reference
 
-All user-facing parameters are consolidated in the **KEY INPUTS** cell. No other cell needs to be modified for a typical use case.
+All parameters live in the **KEY INPUTS** cell. No other cell needs editing for a standard run.
 
 ### Equipment dimensions
 
-| Parameter | Default | Description |
-|---|---|---|
-| `BESS_WIDTH` | `6.06 m` | Container width (X axis) |
-| `BESS_HEIGHT` | `2.44 m` | Container depth (Y axis) |
-| `MVS_WIDTH` | `6.06 m` | MVS/PCS width |
-| `MVS_HEIGHT` | `2.44 m` | MVS/PCS depth |
+| Parameter | Default | Notes |
+|:---|:---:|:---|
+| `BESS_WIDTH` | `6.06 m` | Container width along the X axis |
+| `BESS_HEIGHT` | `2.44 m` | Container depth along the Y axis |
+| `MVS_WIDTH` | `6.06 m` | |
+| `MVS_HEIGHT` | `2.44 m` | |
 
-> Default values match the **Sungrow PowerTitan 20-ft** container form factor.
+> Defaults match the **Sungrow PowerTitan 20-ft** form factor.
 
-### Clearance distances
+### Clearance model
 
-Clearances are defined per side for each equipment type. Clearance zones **can overlap** each other — they represent O&M access, fire safety, and ventilation requirements, not hard structural exclusions. Equipment footprints, however, must never enter another unit's clearance zone.
+Each side of each equipment type carries an independent clearance distance. Clearance zones represent O&M access, fire separation, and ventilation — they **may overlap each other** but a footprint must never enter another unit's clearance zone.
 
-| Side | Direction |
-|---|---|
-| `front` | +Y — faces the access aisle |
-| `back` | −Y — rear of the container |
-| `left` | −X |
-| `right` | +X |
+```
+           ┌──────────────────────────────┐
+           │         front (+Y)           │
+           │   ┌──────────────────────┐   │
+  left     │   │                      │   │  right
+  (−X)     │   │      FOOTPRINT       │   │  (+X)
+           │   │    6.06 m × 2.44 m   │   │
+           │   └──────────────────────┘   │
+           │          back (−Y)           │
+           └──────────────────────────────┘
+```
 
 ```python
 BESS_CLEARANCE = {"front": 2.0, "back": 1.0, "left": 1.0, "right": 1.0}
@@ -111,62 +186,88 @@ MVS_CLEARANCE  = {"front": 3.0, "back": 1.5, "left": 1.5, "right": 1.5}
 ### System constraints
 
 | Parameter | Default | Description |
-|---|---|---|
-| `MAX_BESS_PER_MVS` | `4` | Hard cap on battery units per inverter cluster |
-| `MIN_MVS_SPACING` | `0` | Optional minimum centre-to-centre distance between MVS units (m). Set to `0` to rely only on clearance geometry (recommended) |
-| `GRID_RESOLUTION` | `2.0 m` | Candidate placement grid step. Finer grids find more positions but increase runtime |
-| `SETBACK` | `0 m` | Inward buffer applied to the site boundary before placement |
+|:---|:---:|:---|
+| `MAX_BESS_PER_MVS` | `4` | Hard cap on batteries per inverter cluster |
+| `MIN_MVS_SPACING` | `0 m` | Extra minimum centre-to-centre gap between MVS units. `0` = rely on clearance geometry only (recommended) |
+| `GRID_RESOLUTION` | `2.0 m` | Candidate placement step. Finer = more positions found, slower runtime |
+| `SETBACK` | `0 m` | Inward buffer shrunk from the site boundary before placement |
 
 ### Cable crossing strategy
 
 ```python
-AVOID_CABLE_CROSSINGS = False   # True → Voronoi reassignment pass
+AVOID_CABLE_CROSSINGS = False
 ```
 
-| Value | Behaviour |
-|---|---|
-| `False` | Greedy per-cluster fill. Each MVS takes the closest available BESS before the next MVS is placed. Maximises total battery count. Inter-cluster cables may cross. |
-| `True` | After greedy placement, all BESS are globally reassigned to their geometrically nearest MVS (Voronoi swap). Physical positions are unchanged; only the electrical assignment changes. Eliminates cable crossings with minimal impact on battery count. |
+| Value | Behaviour | Trade-off |
+|:---|:---|:---|
+| `False` | Greedy per-cluster: each MVS claims its closest BESS before the next MVS is placed | Maximum battery count; inter-cluster cables may cross |
+| `True` | Same greedy placement, then a Voronoi swap: each BESS is reassigned to its nearest MVS without moving physically | No inter-cluster crossings; negligible reduction in battery count |
 
 ---
 
-## Algorithm
+## How the Algorithm Works
 
-The placement engine runs in a single interleaved loop:
+### Site preparation
+
+1. Build the site polygon from vertices.
+2. Apply optional setback (`site.buffer(-SETBACK)`).
+3. Subtract restricted zones (`site.difference(zone)`).
+4. Generate a uniform candidate grid across the bounding box at `GRID_RESOLUTION` step.
+
+### Interleaved cluster placement
+
+A global pool `avail` tracks all grid positions not yet blocked by placed equipment. The main loop runs until `avail` is too sparse to score another cluster:
 
 ```
-while avail has enough positions:
-    1. Score all valid MVS candidates
-       → pick the one whose k nearest available positions are closest
-         (minimises expected intra-cluster cable length)
-    2. Place that MVS; prune avail for its clearance zone
-    3. Fill up to MAX_BESS_PER_MVS BESS for this MVS
-       → at each slot, scan avail and score each candidate:
-           score = dist_to_MVS + 0.5 × dist_to_nearest_cluster_member
-       → this compactness term pulls successive BESS toward the growing
-         cluster, creating tight row-like arrangements
-    4. Prune avail for each placed BESS
-    5. If MVS got zero BESS, discard it and continue
+REPEAT:
+  ┌─ MVS SELECTION ──────────────────────────────────────────────┐
+  │  For every position in avail:                                │
+  │    - Build MVS footprint + clearance at that position        │
+  │    - Check placement validity                                │
+  │    - Score = sum of distances to the k nearest avail points  │
+  │      (proxy for expected intra-cluster cable length)         │
+  │  → Commit the lowest-scoring valid position as next MVS      │
+  │  → Prune avail for the MVS clearance zone                    │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ BESS FILLING ───────────────────────────────────────────────┐
+  │  REPEAT up to MAX_BESS_PER_MVS times:                       │
+  │    For every position remaining in avail:                    │
+  │      score = dist_to_MVS + 0.5 × dist_to_nearest_cluster    │
+  │    → Commit the lowest-scoring valid position as next BESS   │
+  │    → Prune avail for this BESS's clearance zone              │
+  │  The compactness term (0.5 × d_cluster) pulls each new       │
+  │  BESS toward the growing cluster, forming tight rows         │
+  └──────────────────────────────────────────────────────────────┘
+  If MVS received zero BESS → discard it
+UNTIL avail too sparse
 ```
 
-Because `avail` shrinks with every piece of equipment placed — both MVS and BESS — the loop naturally terminates before battery space is exhausted. This avoids the failure mode of a two-phase approach (all MVS first, then all BESS) where Phase 1 can deplete all available positions before any batteries are placed.
+Because `avail` shrinks after every placement (MVS and BESS alike), the loop self-terminates before battery space is exhausted. A two-phase approach — all MVS first, then all BESS — fails on dense sites because Phase 1 depletes `avail` before Phase 2 can run.
 
-If `AVOID_CABLE_CROSSINGS = True`, a post-processing Voronoi swap pass runs after the greedy loop: all BESS keep their physical positions but are globally reassigned to the nearest MVS with remaining capacity.
+### Voronoi swap (optional)
 
-### Placement validity rules
+When `AVOID_CABLE_CROSSINGS = True`, a post-processing pass runs after the greedy loop:
 
-A candidate position is valid if and only if:
+1. Clear all BESS-to-MVS assignments.
+2. Sort every BESS by its distance to the nearest MVS.
+3. Assign each BESS to the nearest MVS that still has capacity.
 
-1. The equipment **footprint** is fully contained within the usable site polygon
-2. The footprint does not intersect any non-buildable zone
-3. The footprint does not enter the clearance zone of any already-placed unit
-4. The new unit's clearance zone does not overlap any already-placed footprint
+Physical positions are untouched. Only the electrical grouping changes, which eliminates cable crossings between clusters.
+
+### Placement validity
+
+A candidate passes if:
+
+1. Its footprint is **fully contained** within the usable site polygon.
+2. Its footprint does **not intersect** any non-buildable zone.
+3. Its footprint does **not enter** the clearance zone of any already-placed unit.
+4. Its clearance zone does **not overlap** any already-placed footprint.
 
 ---
 
 ## Output
 
-After running, the notebook prints a results summary:
+### Console summary
 
 ```
 ===== RESULTS =====
@@ -181,34 +282,52 @@ Total cable length : 412.3 m
 Avg cable per BESS : 13.7 m
 ```
 
-And renders a 2D layout plot:
+### Layout plot legend
 
-- **Black outline** — usable site boundary
-- **Gold fill** — non-buildable zones
-- **Colour per cluster** — each MVS and its assigned BESS share a colour
-- **Dashed outlines** — clearance zones (lighter shade)
-- **Lines** — cable runs from each BESS centroid to its MVS
-- **Title** — cluster count, total BESS, total cable length, and average cable per BESS
+| Element | Meaning |
+|:---|:---|
+| Black outline | Usable site boundary (after setback and restricted zones removed) |
+| Gold fill | Non-buildable zones |
+| Solid colour fill (light) | Cluster colour — BESS footprints |
+| Solid colour fill (dark) | Cluster colour — MVS footprint |
+| Dashed outline | Clearance zone boundary |
+| Thin lines | Cable runs (BESS centroid → MVS centroid) |
+| `M1`, `M2`, … | MVS unit labels |
 
-> To add the layout image to this README, export the plot with `plt.savefig("layout.png", dpi=150)` and replace this note with `![Layout](layout.png)`.
+### Saving the plot
+
+Add this line before `plt.show()` in the last cell to export the image:
+
+```python
+plt.savefig("docs/layout.png", dpi=150, bbox_inches="tight")
+```
 
 ---
 
-## Project Structure
+## Limitations
 
-```
-Layout_BESS_Tool/
-└── Layout.ipynb        # Single-notebook tool — all logic, config, and visualisation
-```
+This tool is designed for speed and simplicity at the pre-feasibility stage. It does not cover:
 
-The notebook is intentionally self-contained. All geometry logic, the placement engine, and the visualisation live in a single file so it can be shared and run without any package installation beyond three standard scientific Python libraries.
+- **Container rotation** — all units are placed at 0° (width along X, depth along Y). No 90° rotation option.
+- **Optimality guarantees** — the greedy algorithm finds a good solution but not necessarily the global maximum.
+- **Non-rectangular footprints** — L-shaped or irregular equipment cannot be modelled.
+- **Mixed equipment types** — only one BESS type and one MVS type per run; no mixed-capacity clusters.
+- **Vertical stacking** — 2D layout only; no multi-storey or raised-platform arrangements.
+- **Cost optimisation** — the objective is purely to maximise BESS count; cable cost, land cost, and civil works are not considered.
+- **Large sites with fine grids** — runtime scales roughly as O(|avail|²) per MVS selection; sites larger than ~200 m × 200 m with `GRID_RESOLUTION < 2.0 m` may be slow.
 
 ---
 
-## Dependencies
+## Roadmap
 
-| Library | Purpose |
-|---|---|
-| [Shapely](https://shapely.readthedocs.io/) | 2D polygon geometry — containment, intersection, buffering |
-| [NumPy](https://numpy.org/) | Vectorised distance calculations and grid generation |
-| [Matplotlib](https://matplotlib.org/) | Layout visualisation |
+- [ ] 90° container rotation option
+- [ ] Configurable minimum BESS count per cluster (discard under-filled MVS)
+- [ ] Export layout to DXF / SVG for CAD import
+- [ ] Multi-scenario batch mode (sweep over `MAX_BESS_PER_MVS` or clearance values)
+- [ ] Interactive site polygon tracing (click-to-define vertices)
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) for details.
