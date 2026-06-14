@@ -159,10 +159,81 @@ def plot_all_standalone(*results, config, figsize=DEFAULT_STANDALONE_FIGSIZE):
     for res in results:
         plot_individual(res, config, figsize=figsize)
 
-def print_comparison(*results):
+import plotly.graph_objects as go
+import plotly.express as px
+
+def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=None):
+    fig = go.Figure()
+
+    if not site.is_empty:
+        x, y = site.exterior.xy
+        fig.add_trace(go.Scatter(x=list(x), y=list(y), mode='lines', line=dict(color='black', width=2), name="Site Boundary", hoverinfo='skip'))
+
+    for zone in non_buildable:
+        if not zone.is_empty:
+            x, y = zone.exterior.xy
+            fig.add_trace(go.Scatter(x=list(x), y=list(y), fill='toself', fillcolor='rgba(255, 215, 0, 0.45)', line=dict(color='goldenrod', width=1), name="Non-buildable", hoverinfo='skip'))
+
+    colors = px.colors.qualitative.Plotly
+    mvs_map = {id(m): f"M{i+1}" for i, m in enumerate(mvs_list)}
+    
+    for i, mvs in enumerate(mvs_list):
+        col = colors[i % len(colors)]
+        mvs_id = mvs.get("id", f"M{i+1}")
+        
+        # BESS and cables
+        for j, bess in enumerate(mvs["assigned_bess"]):
+            bess_id = bess.get("id", f"B{j+1}_(M{i+1})")
+            
+            # Cable
+            fig.add_trace(go.Scatter(
+                x=[bess["footprint"].centroid.x, mvs["footprint"].centroid.x],
+                y=[bess["footprint"].centroid.y, mvs["footprint"].centroid.y],
+                mode='lines', line=dict(color=col, width=1.5), opacity=0.7, showlegend=False, hoverinfo='skip'
+            ))
+            
+            # BESS Footprint
+            bx, by = bess["footprint"].exterior.xy
+            rot_str = "90°" if bess.get("rotated", False) else "0°"
+            hover_text = f"ID: {bess_id}<br>Type: BESS<br>X: {bess['footprint'].bounds[0]:.1f}<br>Y: {bess['footprint'].bounds[1]:.1f}<br>Rotated: {rot_str}<br>Assigned MVS: {mvs_id}"
+            
+            fig.add_trace(go.Scatter(
+                x=list(bx), y=list(by), fill='toself', fillcolor=col, opacity=0.8, line=dict(color='black', width=1),
+                name=f"BESS ({mvs_id})", text=hover_text, hoverinfo='text', showlegend=False
+            ))
+            
+        # MVS Footprint
+        mx, my = mvs["footprint"].exterior.xy
+        rot_str = "90°" if mvs.get("rotated", False) else "0°"
+        hover_text = f"ID: {mvs_id}<br>Type: MVS<br>X: {mvs['footprint'].bounds[0]:.1f}<br>Y: {mvs['footprint'].bounds[1]:.1f}<br>Rotated: {rot_str}<br>Assigned BESS: {len(mvs['assigned_bess'])}"
+        
+        fig.add_trace(go.Scatter(
+            x=list(mx), y=list(my), fill='toself', fillcolor=col, opacity=1.0, line=dict(color='black', width=2),
+            name=f"MVS {mvs_id}", text=hover_text, hoverinfo='text'
+        ))
+        
+    fig.update_layout(
+        title=title or "BESS Layout Visualization",
+        xaxis_title="X (m)", yaxis_title="Y (m)",
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+        plot_bgcolor='white',
+        margin=dict(l=20, r=20, t=40, b=20),
+        height=700
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+    
+    return fig
+
+def print_comparison(config, *results):
+    bess_cap = config.get("bess_unit_mwh", 5.0)
+    mvs_pow  = config.get("mvs_station_mw", 2.5)
+
     rows = [
         ("MVS Count",       lambda m: f"{m['mvs_count']}"),
         ("BESS Count",      lambda m: f"{m['bess_count']}"),
+        ("Total Power (MW)",lambda m: f"{m['mvs_count'] * mvs_pow:.1f}"),
+        ("Total Energy (MWh)",lambda m: f"{m['bess_count'] * bess_cap:.1f}"),
         ("Fully Sat. MVS",  lambda m: f"{m['full_mvs']} / {m['mvs_count']}"),
         ("Total Cable (m)", lambda m: f"{m['total_cable']:.1f}"),
         ("Avg Cable (m)",   lambda m: f"{m['avg_cable']:.1f}"),

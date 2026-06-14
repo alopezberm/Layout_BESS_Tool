@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
+import ast
+import hashlib
+
 from engine import (
     run_bess_optimization, 
     _compute_metrics, 
@@ -11,16 +13,13 @@ from engine import (
     create_clearance_polygon, 
     is_valid_placement
 )
-from visualization import plot_layout
+from visualization import plot_layout_plotly
 
 st.set_page_config(page_title="BESS-Opt Engine", layout="wide")
 
-# =========================================================
-# CONFIGURATION CONSTANTS
-# =========================================================
-CABLE_CORRIDOR = [(15.4, 0), (21.9, 0), (47.7, 90.4), (31.9, 90.4)]
-OUT_OF_SCOPE = [(21.9, 16), (53.3, 16), (53.3, 90.4), (47.7, 90.4)]
-SITE_VERTICES = [(0, 0), (53.3, 0), (53.3, 16), (21.9, 16), (47.7, 90.4), (8, 90.4), (0, 90.4)]
+# Initialize session state cache
+if "baseline_cache" not in st.session_state:
+    st.session_state["baseline_cache"] = {}
 
 # =========================================================
 # HELPERS
@@ -53,6 +52,7 @@ def df_to_engine(df, config, site, non_buildable):
     mvs_list = []
     bess_list = []
     placed = []
+    errors = []
     
     bess_eq = config["equipment"]["BESS"]
     mvs_eq = config["equipment"]["MVS"]
@@ -76,7 +76,7 @@ def df_to_engine(df, config, site, non_buildable):
         
         valid = is_valid_placement(fp, cl_poly, site, non_buildable, placed)
         if not valid:
-            st.sidebar.error(f"Collision Detected: MVS {row['ID']} overlaps with obstacles/equipment.")
+            errors.append(f"Collision Detected: MVS {row['ID']} overlaps with obstacles/equipment or goes out of bounds.")
             
         mvs_list.append(mvs_obj)
         placed.append(mvs_obj)
@@ -106,20 +106,47 @@ def df_to_engine(df, config, site, non_buildable):
             
         valid = is_valid_placement(fp, cl_poly, site, non_buildable, placed)
         if not valid:
-            st.sidebar.warning(f"Collision Detected: BESS {row['ID']} overlaps with obstacles/equipment.")
+            errors.append(f"Collision Detected: BESS {row['ID']} overlaps with obstacles/equipment or goes out of bounds.")
             
         bess_list.append(bess_obj)
         placed.append(bess_obj)
         
-    return mvs_list, bess_list
+    return mvs_list, bess_list, errors
+
+def get_hash(state_str):
+    return hashlib.sha256(state_str.encode()).hexdigest()
 
 # =========================================================
 # UI DEFINITION
 # =========================================================
 st.title("🔋 BESS-Opt: Interactive Engineering Dashboard")
 
+# ---------------------------------------------------------
+# STEP 1: SITE BOUNDARY & ZONE DEFINITIONS
+# ---------------------------------------------------------
+default_site = "[(0, 0), (53.3, 0), (53.3, 16), (21.9, 16), (47.7, 90.4), (8, 90.4), (0, 90.4)]"
+default_cable = "[(15.4, 0), (21.9, 0), (47.7, 90.4), (31.9, 90.4)]"
+default_restrict = "[(21.9, 16), (53.3, 16), (53.3, 90.4), (47.7, 90.4)]"
+
+with st.expander("Step 1: Site Boundary & Zone Definitions", expanded=True):
+    st.markdown("Define the exact coordinate vertices (X, Y tuples) for the physical site.")
+    site_input = st.text_area("Global Property Boundary", value=default_site, help="The outermost perimeter where equipment can be placed.")
+    non_buildable_input = st.text_area("Non-Buildable Zones", value=default_cable, help="Areas reserved for access roads, environmental restrictions, or buffer corridors where no hardware can be placed.")
+    restricted_input = st.text_area("Restricted / Out of Scope Zones", value=default_restrict, help="Additional zones completely excluded from evaluation.")
+
+try:
+    site_vertices = ast.literal_eval(site_input)
+    non_buildable_vertices = [ast.literal_eval(non_buildable_input)] if non_buildable_input.strip() else []
+    restricted_vertices = [ast.literal_eval(restricted_input)] if restricted_input.strip() else []
+except Exception as e:
+    st.error(f"Error parsing coordinates: {e}")
+    st.stop()
+
+# ---------------------------------------------------------
+# STEP 2: TECHNICAL & COMMERCIAL PARAMETERS
+# ---------------------------------------------------------
 with st.sidebar:
-    st.header("⚙️ Optimization Parameters")
+    st.header("Step 2: Parameters")
     
     mode = st.selectbox("Baseline Mode", ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"])
     
@@ -139,13 +166,13 @@ with st.sidebar:
     max_bess = st.slider("Max BESS per MVS", 1, 8, 4, 1)
 
     st.subheader("Commercial Equipment Scaling")
-    bess_cap = st.slider("BESS Unit Capacity (MWh)", 0.5, 10.0, 5.0, 0.5)
-    mvs_pow = st.slider("MVS Station Power (MW)", 0.5, 5.0, 2.5, 0.5)
+    bess_cap = st.slider("BESS Unit Capacity (MWh)", 0.0, 15.0, 5.0, 0.5)
+    mvs_pow = st.slider("MVS Station Power (MW)", 0.0, 10.0, 2.5, 0.5)
 
 CONFIG = {
-    "site_vertices": SITE_VERTICES,
+    "site_vertices": site_vertices,
     "setback": 0,
-    "zones": {"non_buildable": [CABLE_CORRIDOR], "restricted": [OUT_OF_SCOPE]},
+    "zones": {"non_buildable": non_buildable_vertices, "restricted": restricted_vertices},
     "equipment": {
         "BESS": {
             "width": 6.06, "height": 2.44,
@@ -159,56 +186,85 @@ CONFIG = {
     "max_bess_per_mvs": max_bess,
     "max_cable_length": 25,
     "grid_resolution": 2.0,
+    "bess_unit_mwh": bess_cap,
+    "mvs_station_mw": mvs_pow
 }
 
-# Track if parameters changed to reset baseline
-current_params = (mode, b_front, b_back, b_left, b_right, m_front, m_back, m_left, m_right, max_bess)
-if "last_params" not in st.session_state or st.session_state["last_params"] != current_params:
-    with st.spinner("Executing Engine Optimization..."):
+# ---------------------------------------------------------
+# CACHING & ENGINE EXECUTION
+# ---------------------------------------------------------
+state_str = f"{site_input}|{non_buildable_input}|{restricted_input}|{mode}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{max_bess}"
+cache_key = get_hash(state_str)
+
+if cache_key not in st.session_state["baseline_cache"]:
+    with st.spinner(f"Executing {mode.replace('_', ' ').title()} Optimization (First Run)..."):
         baseline_res = run_bess_optimization(CONFIG, mode=mode, verbose=False)
-        st.session_state["df"] = engine_to_df(baseline_res["mvs_list"], baseline_res["bess_list"])
-    st.session_state["last_params"] = current_params
+        st.session_state["baseline_cache"][cache_key] = engine_to_df(baseline_res["mvs_list"], baseline_res["bess_list"])
 
-st.markdown("### 1. Interactive Data Editor")
-st.markdown("Modify coordinates, rotate units, reassign networks, or add/delete rows. The layout instantly re-evaluates.")
-edited_df = st.data_editor(st.session_state["df"], num_rows="dynamic", use_container_width=True)
+# Determine if the physical parameters changed, if so we load the cache to the editor
+if "last_cache_key" not in st.session_state or st.session_state["last_cache_key"] != cache_key:
+    st.session_state["editor_df"] = st.session_state["baseline_cache"][cache_key].copy()
+    st.session_state["last_cache_key"] = cache_key
 
-# Re-evaluate
+# ---------------------------------------------------------
+# STEP 3: GRAPHICAL ENGINE & INTERACTIVE SANDBOX
+# ---------------------------------------------------------
+st.header("Step 3: Graphical Engine & Interactive Sandbox")
+
+col_chart, col_data = st.columns([3, 2])
+
+# We use the editor state
+editor_df = st.session_state["editor_df"]
+
 site_raw = create_site(CONFIG["site_vertices"])
 site, non_buildable = prepare_site(site_raw, CONFIG)
-mvs_list, bess_list = df_to_engine(edited_df, CONFIG, site, non_buildable)
-metrics = _compute_metrics(site, non_buildable, mvs_list, bess_list, CONFIG["max_bess_per_mvs"])
+mvs_list, bess_list, placement_errors = df_to_engine(editor_df, CONFIG, site, non_buildable)
 
-st.markdown("### 2. Live Layout KPIs")
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-col1.metric("MVS Placed", metrics["mvs_count"])
-col2.metric("BESS Placed", metrics["bess_count"])
-col3.metric("Area Saturation", f"{metrics['area_saturation_pct']:.1f}%")
-col4.metric("Total Cable", f"{metrics['total_cable']:.1f} m")
+with col_chart:
+    st.markdown("### 2D Interactive Layout")
+    for err in placement_errors:
+        st.error(err)
+    fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, CONFIG, title=f"BESS Layout ({mode.replace('_', ' ').title()})")
+    st.plotly_chart(fig, use_container_width=True)
 
-total_energy = metrics["bess_count"] * bess_cap
-total_power = metrics["mvs_count"] * mvs_pow
-col5.metric("Total Energy", f"{total_energy:.1f} MWh")
-col6.metric("Total Power", f"{total_power:.1f} MW")
+with col_data:
+    st.markdown("### Live Performance Metrics")
+    metrics = _compute_metrics(site, non_buildable, mvs_list, bess_list, CONFIG["max_bess_per_mvs"])
+    total_energy = metrics["bess_count"] * bess_cap
+    total_power = metrics["mvs_count"] * mvs_pow
+    
+    kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+    kpi_col1.metric("MVS Placed", metrics["mvs_count"])
+    kpi_col2.metric("BESS Placed", metrics["bess_count"])
+    kpi_col3.metric("Area Saturation", f"{metrics['area_saturation_pct']:.1f}%")
+    
+    kpi_col4, kpi_col5, kpi_col6 = st.columns(3)
+    kpi_col4.metric("Total Cable", f"{metrics['total_cable']:.1f} m")
+    kpi_col5.metric("Total Energy", f"{total_energy:.1f} MWh")
+    kpi_col6.metric("Total Power", f"{total_power:.1f} MW")
 
-st.markdown("### 3. 2D Clearance Canvas")
-fig, ax = plt.subplots(figsize=(10, 14))
-plot_layout(site, non_buildable, mvs_list, bess_list, CONFIG, ax=ax, title="BESS Layout Overrides")
-st.pyplot(fig)
+    st.markdown("### Interactive Data Sandbox")
+    st.markdown("Modify coordinates, rotate units, reassign networks, or add/delete rows.")
+    new_edited_df = st.data_editor(editor_df, num_rows="dynamic", use_container_width=True)
+    
+    if not new_edited_df.equals(editor_df):
+        st.session_state["editor_df"] = new_edited_df
+        st.rerun()
 
-export_df = edited_df.copy()
-export_df.loc[export_df["Type"] == "BESS", "Capacity (MWh)"] = bess_cap
-export_df.loc[export_df["Type"] == "MVS", "Capacity (MWh)"] = 0.0
-export_df.loc[export_df["Type"] == "MVS", "Power (MW)"] = mvs_pow
-export_df.loc[export_df["Type"] == "BESS", "Power (MW)"] = 0.0
+    export_df = new_edited_df.copy()
+    export_df.loc[export_df["Type"] == "BESS", "Capacity (MWh)"] = bess_cap
+    export_df.loc[export_df["Type"] == "MVS", "Capacity (MWh)"] = 0.0
+    export_df.loc[export_df["Type"] == "MVS", "Power (MW)"] = mvs_pow
+    export_df.loc[export_df["Type"] == "BESS", "Power (MW)"] = 0.0
 
-csv_str = export_df.to_csv(index=False)
-summary_lines = f"\n\nTotal Plant Power: {total_power:.1f} MW\nTotal Plant Energy: {total_energy:.1f} MWh\n"
-csv_str += summary_lines
+    csv_str = export_df.to_csv(index=False)
+    summary_lines = f"\n\nTotal Plant Power: {total_power:.1f} MW\nTotal Plant Energy: {total_energy:.1f} MWh\n"
+    csv_str += summary_lines
 
-st.download_button(
-    label="📥 Download Engineering Report (CSV)",
-    data=csv_str.encode('utf-8'),
-    file_name='bess_boq_layout.csv',
-    mime='text/csv',
-)
+    st.download_button(
+        label="📥 Download Engineering Report (CSV)",
+        data=csv_str.encode('utf-8'),
+        file_name='bess_boq_layout.csv',
+        mime='text/csv',
+        use_container_width=True
+    )
