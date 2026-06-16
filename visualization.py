@@ -236,7 +236,47 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
     )
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-    
+
+    return fig
+
+def plot_layout_plotly_hubs(site, non_buildable, mvs_list, bess_list, config, title=None):
+    """Co-located variant of plot_layout_plotly. Renders the standard interactive
+    layout untouched, then overlays a dashed outline + label around each shared
+    foundation pad (hub) so the clustering is visually explicit. Additive: the
+    baseline plot function is reused verbatim and never modified."""
+    fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config,
+                             title=title or "Co-Located / Paired MVS Layout")
+
+    hubs = {}
+    for m in mvs_list:
+        hid = m.get("hub_id")
+        if hid:
+            hubs.setdefault(hid, []).append(m)
+
+    margin = 0.6
+    for hid, members in hubs.items():
+        if len(members) < 2:
+            continue
+        minx = min(m["footprint"].bounds[0] for m in members) - margin
+        miny = min(m["footprint"].bounds[1] for m in members) - margin
+        maxx = max(m["footprint"].bounds[2] for m in members) + margin
+        maxy = max(m["footprint"].bounds[3] for m in members) + margin
+
+        fig.add_trace(go.Scatter(
+            x=[minx, maxx, maxx, minx, minx],
+            y=[miny, miny, maxy, maxy, miny],
+            mode='lines',
+            line=dict(color='#00897B', width=2.5, dash='dot'),
+            name=f"Shared Pad {hid}",
+            hoverinfo='skip',
+        ))
+        fig.add_trace(go.Scatter(
+            x=[(minx + maxx) / 2.0], y=[maxy + margin],
+            mode='text', text=[f"⬡ {hid} ({len(members)} MVS)"],
+            textfont=dict(color='#00695C', size=12),
+            showlegend=False, hoverinfo='skip',
+        ))
+
     return fig
 
 def print_comparison(config, *results):
