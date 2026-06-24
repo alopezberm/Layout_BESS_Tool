@@ -11,6 +11,19 @@ DEFAULT_STANDALONE_FIGSIZE = (10, 14)
 DEFAULT_PANEL_FIGSIZE      = (7, 10)
 
 
+def _as_polygons(geom):
+    """Yield the constituent Polygons of a Polygon or MultiPolygon.
+
+    ``prepare_site`` can return a MultiPolygon when a restricted zone splits the
+    site into disconnected pieces; the renderers must handle both.
+    """
+    if geom.is_empty:
+        return []
+    if geom.geom_type == "MultiPolygon":
+        return list(geom.geoms)
+    return [geom]
+
+
 def plot_layout(site, non_buildable, mvs_list, bess_list, config,
                 ax=None, title=None, figsize=None):
     bess_cl_cfg = config["equipment"]["BESS"]["clearance"]
@@ -27,8 +40,9 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
         fig, ax = plt.subplots(figsize=figsize or DEFAULT_STANDALONE_FIGSIZE)
 
     if not site.is_empty:
-        x, y = site.exterior.xy
-        ax.plot(x, y, color="black", linewidth=2)
+        for poly in _as_polygons(site):
+            x, y = poly.exterior.xy
+            ax.plot(x, y, color="black", linewidth=2)
 
     for zone in non_buildable:
         if not zone.is_empty:

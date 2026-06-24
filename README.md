@@ -29,12 +29,13 @@ tests/        invariant tests
 | :--- | :--- |
 | [`core/config.py`](core/config.py) | Single source of truth: `DEFAULT_EQUIPMENT` + `build_config()`. Both modes build CONFIG here so they can never diverge. |
 | [`core/geometry.py`](core/geometry.py) | Polygon handling (`shapely`), candidate grids, clearance generation, rotation, placement validity. |
-| [`core/placement.py`](core/placement.py) | Multi-pass greedy placement heuristics + Hungarian global cable reassignment. |
+| [`core/placement.py`](core/placement.py) | Shared placement helpers (cluster growth, straggler fill, Hungarian cable reassignment) used by the packer and the co-located engine. |
 | [`core/colocation.py`](core/colocation.py) | Co-located / paired-MVS hub engine (facility-location + hub-balanced assignment). |
 | [`core/metrics.py`](core/metrics.py) | Layout KPIs and hub/civil-works metrics. |
 | [`core/sizing.py`](core/sizing.py) | System sizing: total MW / MWh and 2H / 3H / 4H duration classification. |
 | [`core/serialization.py`](core/serialization.py) | Layout ⇄ DataFrame round-trip and non-corrupting CSV export. |
-| [`core/optimize.py`](core/optimize.py) | `run_bess_optimization` / `run_colocated_optimization` + `MODE_PROFILES`. |
+| [`core/packing.py`](core/packing.py) | **Row/shelf packing engine** (`run_row_packing`) — the primary layout optimizer. |
+| [`core/optimize.py`](core/optimize.py) | `run_colocated_optimization` (co-located / paired-MVS scenario). |
 | [`viz/`](viz/) | `matplotlib_plots`, `plotly_plots`, `compare` (text table). |
 | [`app/app.py`](app/app.py) | Streamlit UI — three-phase workflow; widgets → `build_config` → core → viz. |
 | [`Layout.ipynb`](Layout.ipynb) | Standalone engineering notebook at the repo root, no app dependency. |
@@ -42,20 +43,18 @@ tests/        invariant tests
 
 ## Algorithmic Highlights
 
-1. **Dynamic Grid Resolution** — the seeding pass uses a coarse 2.0 m grid for speed; the `hyper_pack` mode follows up with a 0.5 m micro-grid pass to slot stragglers into otherwise-unreachable gaps.
-2. **Per-Component 90° Rotation** — both BESS containers and MVS units independently evaluate 0° / 90° orientations, with asymmetric clearance zones remapped accordingly.
+1. **Back-to-Back Row Packing** — the engine places containers flush at the exact per-side clearance (not on a lattice), so adjacent rows touch on their small `back` clearance (e.g. 0.15 m), with a centred MVS row every `max_bess_per_mvs` rows for short cable.
+2. **Full 0/90/180/270 Rotation** — every container evaluates all four orientations, with asymmetric clearances remapped accordingly; 180°/270° are what enable back-to-back packing on the small clearance side.
 3. **Row-Alignment Penalty** — a configurable cost term coerces BESS units to inherit their parent MVS orientation and X/Y axis, producing clean architectural rows when uniformity matters.
 4. **Global Min-Cost Reassignment** — after greedy placement, a Hungarian solver re-pairs every BESS to the closest feasible MVS slot across the entire site, minimizing the true Euclidean cable sum subject to the per-MVS capacity cap.
 5. **Collision-Aware Editing** — manual edits in the UI re-run the placement validator so any out-of-bounds or overlapping component is flagged immediately.
 
-## Operating Modes
+## Engines
 
-| Mode | Strategy | Cable Routing | Density |
-| :--- | :--- | :--- | :--- |
-| **Conservative** | Strict cluster adjacency, heavy alignment penalty, clean uniform blocks. | Hard 25 m cap, cluster-bound. | Baseline |
-| **Aggressive** | Relaxed adjacency, greedy distance matching. | Hard 25 m cap. | High |
-| **Ultra-Aggressive** | No cable cap; MVS scaled linearly to support whatever fits. | Unlimited, Hungarian reassignment. | Maximum |
-| **Hyper-Pack** | Adds a 0.5 m fine-grid saturation pass on top of Ultra-Aggressive. | Unlimited, Hungarian reassignment. | Physical saturation |
+| Engine | What it does |
+| :--- | :--- |
+| **Row Pack** ([`core/packing.py`](core/packing.py), `run_row_packing`) | Primary optimizer. Analytic back-to-back shelf packing adaptive to arbitrary concave polygons, evaluating all 4 rotations, with interleaved MVS rows and cable-cap-aware Hungarian assignment. Runs in ~1-3 s. |
+| **Co-Located** ([`core/optimize.py`](core/optimize.py), `run_colocated_optimization`) | Optional scenario that seeds MVS onto shared foundation pads (paired / hub) via facility-location before packing BESS, then balances cable across each hub. |
 
 ## Installation
 
@@ -73,7 +72,7 @@ pip install numpy shapely scipy matplotlib plotly streamlit pandas
 mandated `DEFAULT_EQUIPMENT`); the notebook and the app both use it.
 
 ```python
-from core import build_config, run_bess_optimization, size_system
+from core import build_config, run_row_packing, size_system
 from viz import plot_individual, print_comparison
 
 CONFIG = build_config(
@@ -87,7 +86,7 @@ CONFIG = build_config(
     mvs_station_mw=2.5,
 )
 
-result = run_bess_optimization(CONFIG, mode="hyper_pack", verbose=True)
+result = run_row_packing(CONFIG, verbose=True)
 plot_individual(result, CONFIG)
 
 # System sizing: total MW / MWh and 2H / 3H / 4H duration class.
@@ -96,12 +95,10 @@ print(size_system(m["bess_count"], m["mvs_count"],
                   CONFIG["bess_unit_mwh"], CONFIG["mvs_station_mw"]))
 ```
 
-To benchmark several strategies on the same site:
+Print the metrics table for a run:
 
 ```python
-modes = ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"]
-results = [run_bess_optimization(CONFIG, mode=m, verbose=False) for m in modes]
-print_comparison(CONFIG, *results)
+print_comparison(CONFIG, result)
 ```
 
 The standalone notebook lives at [`Layout.ipynb`](Layout.ipynb) (repo root)
@@ -116,8 +113,8 @@ streamlit run app/app.py
 The app exposes a three-phase workflow:
 
 1. **Site definition** — paste the property boundary, non-buildable corridors and restricted zones as vertex lists; tune BESS / MVS clearances, max BESS per MVS, and commercial MWh / MW scaling factors.
-2. **Multi-scenario benchmarking** — all four modes are solved in parallel and compared side-by-side on BESS count, MVS count, plant energy, plant power, total cable length, and area saturation.
-3. **Deep-dive editor** — click a unit on the interactive Plotly canvas (or pick from the dropdown) to nudge its X/Y coordinates, toggle rotation, reassign its MVS network, or delete it. Collisions are validated live. Layouts can be exported as a 1920×1080 PNG and the bill of quantities as a CSV report.
+2. **Row-Pack optimization** — the back-to-back packing engine runs and reports BESS / MVS count, plant energy, plant power, storage duration, total cable length, and area saturation.
+3. **Deep-dive editor** — click a unit on the interactive Plotly canvas (or pick from the dropdown) to nudge its X/Y coordinates, change orientation (0/90/180/270), reassign its MVS network, or delete it. Collisions are validated live. Layouts can be exported as a 1920×1080 PNG and the bill of quantities as a CSV report.
 
 Benchmark results are cached per input hash, so re-entering Phase 2 with unchanged parameters is instantaneous.
 
@@ -141,7 +138,7 @@ Benchmark results are cached per input hash, so re-entering Phase 2 with unchang
 
 ## Output
 
-`run_bess_optimization` returns a dictionary containing the prepared site polygon, the non-buildable polygons, the lists of placed MVS and BESS objects (with footprint, clearance zone, rotation flag and assignment), and a `metrics` dictionary:
+`run_row_packing` returns a dictionary containing the prepared site polygon, the non-buildable polygons, the lists of placed MVS and BESS objects (with footprint, clearance zone, rotation flag and assignment), and a `metrics` dictionary:
 
 - `mvs_count`, `bess_count`, `full_mvs`
 - `total_cable`, `avg_cable`, `max_cable_used`

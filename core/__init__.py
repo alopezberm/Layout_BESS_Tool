@@ -19,7 +19,8 @@ from .geometry import (
 )
 from .metrics import total_cable_length, compute_metrics, compute_hub_metrics
 from .sizing import size_system, classify_duration
-from .optimize import run_bess_optimization, run_colocated_optimization, MODE_PROFILES
+from .optimize import run_colocated_optimization
+from .packing import run_row_packing
 from .serialization import (
     engine_to_df,
     engine_to_df_with_hubs,
@@ -44,9 +45,8 @@ __all__ = [
     "compute_hub_metrics",
     "size_system",
     "classify_duration",
-    "run_bess_optimization",
     "run_colocated_optimization",
-    "MODE_PROFILES",
+    "run_row_packing",
     "engine_to_df",
     "engine_to_df_with_hubs",
     "df_to_engine",

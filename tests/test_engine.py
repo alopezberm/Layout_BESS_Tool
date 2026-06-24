@@ -16,10 +16,13 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from core import build_config, run_bess_optimization, run_colocated_optimization, size_system
+from core import (
+    build_config,
+    run_colocated_optimization,
+    run_row_packing,
+    size_system,
+)
 from core.config import DEFAULT_EQUIPMENT
-
-MODES = ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"]
 
 
 def make_config(**overrides):
@@ -60,23 +63,44 @@ def _assert_inside_site(res):
             assert not obj["footprint"].intersects(nb), "equipment in non-buildable zone"
 
 
-def test_all_modes_invariants():
+def test_row_packing_invariants():
     config = make_config()
-    max_ratio = config["max_bess_per_mvs"]
-    for mode in MODES:
-        res = run_bess_optimization(config, mode=mode, verbose=False)
-        assert res["metrics"]["bess_count"] > 0, f"{mode}: nothing placed"
-        _assert_no_overlaps(res)
-        _assert_capacity(res, max_ratio)
-        _assert_inside_site(res)
+    res = run_row_packing(config, verbose=False)
+    assert res["metrics"]["bess_count"] > 0, "nothing placed"
+    _assert_no_overlaps(res)
+    _assert_capacity(res, config["max_bess_per_mvs"])
+    _assert_inside_site(res)
 
 
 def test_colocated_invariants():
     config = make_config(colocation={"enabled": True, "group_size": 2, "pad_gap": 0.5})
-    res = run_colocated_optimization(config, mode="aggressive", verbose=False)
+    res = run_colocated_optimization(config, verbose=False)
     _assert_capacity(res, config["max_bess_per_mvs"])
     _assert_inside_site(res)
     assert res["hub_metrics"]["hub_count"] >= 1, "no hubs placed"
+
+
+def test_row_packing_backtoback():
+    # Tight back clearance: the shelf packer must produce real back-to-back gaps
+    # (near 0.15 m), respect capacity and bounds, and not overlap.
+    config = make_config(
+        bess_clearance={"front": 3.5, "back": 0.15, "left": 0.6, "right": 2.0},
+        mvs_clearance={"front": 3.0, "back": 1.7, "left": 2.0, "right": 2.0},
+    )
+    res = run_row_packing(config, verbose=False)
+    assert res["metrics"]["bess_count"] > 0
+    _assert_no_overlaps(res)
+    _assert_capacity(res, config["max_bess_per_mvs"])
+    _assert_inside_site(res)
+    # at least some BESS pair must actually sit back-to-back (< 0.3 m apart)
+    bess = res["bess_list"]
+    min_gap = min(
+        a["footprint"].distance(b["footprint"])
+        for i, a in enumerate(bess) for b in bess[i + 1:]
+    )
+    assert min_gap < 0.3, f"no back-to-back packing achieved (min gap {min_gap:.2f} m)"
+    # every assigned BESS must be within the cable cap of its MVS
+    assert res["metrics"]["max_cable_used"] <= config["max_cable_length"] + 1e-6
 
 
 def test_sizing_duration_class():
@@ -97,13 +121,14 @@ def test_default_equipment_contract():
 def test_empty_site_does_not_crash():
     # A site smaller than one container should place nothing, not raise.
     config = build_config(site_vertices=[(0, 0), (1, 0), (1, 1), (0, 1)])
-    res = run_bess_optimization(config, mode="aggressive", verbose=False)
+    res = run_row_packing(config, verbose=False)
     assert res["metrics"]["bess_count"] == 0
 
 
 if __name__ == "__main__":
-    test_all_modes_invariants()
+    test_row_packing_invariants()
     test_colocated_invariants()
+    test_row_packing_backtoback()
     test_sizing_duration_class()
     test_default_equipment_contract()
     test_empty_site_does_not_crash()

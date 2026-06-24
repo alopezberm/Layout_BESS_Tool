@@ -18,8 +18,8 @@ import pandas as pd
 
 from core import (
     build_config,
-    run_bess_optimization,
     run_colocated_optimization,
+    run_row_packing,
     compute_metrics,
     create_site,
     prepare_site,
@@ -157,7 +157,7 @@ with tab_standard:
         st.markdown("---")
         _, center_col, _ = st.columns([1, 2, 1])
         with center_col:
-            if st.button("🚀 Run Multi-Scenario Optimization Engine", type="primary", use_container_width=True):
+            if st.button("🚀 Run Row-Pack Optimization Engine", type="primary", use_container_width=True):
                 st.session_state["phase"] = 2
                 st.rerun()
 
@@ -181,14 +181,14 @@ with tab_standard:
     # PHASE 2: BENCHMARKING GRID
     # ---------------------------------------------------------
     if st.session_state["phase"] == 2:
-        st.markdown("## 📊 Multi-Scenario Benchmarking Results")
+        st.markdown("## 📊 Row-Pack Layout Result")
         if st.button("⬅️ Edit Site Parameters"):
             st.session_state["phase"] = 1
             st.rerun()
 
         state_str = f"{st.session_state['site_input']}|{st.session_state['non_buildable_input']}|{st.session_state['restricted_input']}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{max_bess}"
         cache_key = get_hash(state_str)
-        modes = ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"]
+        modes = ["row_pack"]
 
         if cache_key not in st.session_state["benchmark_results"]:
             st.session_state["benchmark_results"][cache_key] = {}
@@ -198,8 +198,8 @@ with tab_standard:
 
             try:
                 for i, mode in enumerate(modes):
-                    status_text.text(f"Calculating {mode.replace('_', ' ').title()} layout...")
-                    res = run_bess_optimization(CONFIG, mode=mode, verbose=False)
+                    status_text.text("Calculating Row Pack layout (back-to-back)...")
+                    res = run_row_packing(CONFIG, verbose=False)
                     st.session_state["benchmark_results"][cache_key][mode] = {
                         "df": engine_to_df(res["mvs_list"], res["bess_list"]),
                         "metrics": res["metrics"],
@@ -216,7 +216,7 @@ with tab_standard:
             progress_bar.empty()
 
         results = st.session_state["benchmark_results"][cache_key]
-        cols = st.columns(4)
+        cols = st.columns(len(modes))
 
         for i, mode in enumerate(modes):
             with cols[i]:
@@ -433,13 +433,11 @@ with tab_colocated:
         balance_tol = cc3.slider("Hub Balance Tolerance (BESS)", 0, 4, 1, 1,
                                  help="Best-effort max difference in BESS count between members of a hub.")
 
-        cc4, cc5, cc6 = st.columns(3)
+        cc4, cc5 = st.columns(2)
         hub_radius = cc4.slider("Hub Snap Search Radius (m)", 1.0, 25.0, 8.0, 0.5,
                                 help="How far the optimal continuous hub centre may be relocated to find a valid pad.")
         target_hubs = cc5.number_input("Target Hub Count (0 = auto)", 0, 100, 0, 1,
                                        help="Override the automatic facility-location hub count.")
-        co_mode = cc6.selectbox("Packing Profile", ["aggressive", "conservative", "ultra_aggressive"], index=0,
-                                help="Reuses the baseline BESS packing behaviour around the seeded hubs.")
 
     run_co = st.button("🔗 Run Co-Located / Paired MVS Optimization", type="primary", use_container_width=True)
 
@@ -466,7 +464,7 @@ with tab_colocated:
 
         try:
             with st.spinner("Solving facility-location hubs and hub-balanced cable assignment..."):
-                co_res = run_colocated_optimization(CO_CONFIG, mode=co_mode, verbose=False)
+                co_res = run_colocated_optimization(CO_CONFIG, verbose=False)
             st.session_state["colocated_results"] = co_res
             st.session_state["colocated_config"] = CO_CONFIG
         except Exception as e:

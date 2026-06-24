@@ -1,5 +1,9 @@
-"""Baseline greedy placement heuristics and the global Hungarian cable
-reassignment. Pure layout logic — no rendering, no UI.
+"""Shared placement helpers: candidate pruning, greedy cluster growth, a
+straggler-fill pass, and the global Hungarian cable reassignment.
+
+These are the validated primitives reused by the co-located engine
+(``core.optimize``) and the row packer (``core.packing``). Pure layout logic —
+no rendering, no UI.
 """
 
 import numpy as np
@@ -10,7 +14,6 @@ from .geometry import (
     is_valid_placement,
     get_oriented_dimensions,
     ORIENTATIONS,
-    create_candidate_grid,
 )
 
 
@@ -30,13 +33,6 @@ def _prune_avail(avail, blocker_fp, blocker_cl, bess_eq):
         if keep:
             out.append((gx, gy))
     return out
-
-
-def _score_mvs(cx, cy, avail_arr, scoring_r, max_ratio):
-    dists = np.hypot(avail_arr[:, 0] - cx, avail_arr[:, 1] - cy)
-    reachable = dists[dists <= scoring_r] if scoring_r > 0 else dists
-    top_k = np.sort(reachable)[1 : max_ratio + 1]
-    return float(top_k.sum()) if top_k.size > 0 else float("inf")
 
 
 def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
@@ -154,134 +150,11 @@ def _stragglers_pass(avail, site, non_buildable, placed, mvs_list, bess_list,
     return avail
 
 
-def _stragglers_pass_singlepass(fine_avail, site, non_buildable, placed,
-                                mvs_list, bess_list, bess_eq, max_ratio,
-                                max_cable):
-    bess_cl_dict = bess_eq["clearance"]
-    w, h = bess_eq["width"], bess_eq["height"]
-    unlimited = max_cable <= 0
-    candidates = []
-    for (gx, gy) in fine_avail:
-        for angle in ORIENTATIONS:
-            rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
-            b_fp = create_equipment_polygon(gx, gy, rw, rh)
-            b_cl = create_clearance_polygon(b_fp, rcl)
-            if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
-                continue
-            bx, by = b_fp.centroid.x, b_fp.centroid.y
-            best_d = float("inf")
-            for m in mvs_list:
-                mx, my = m["footprint"].centroid.x, m["footprint"].centroid.y
-                d = np.hypot(bx - mx, by - my)
-                if (unlimited or d <= max_cable) and d < best_d:
-                    best_d = d
-            if best_d == float("inf"):
-                continue
-            candidates.append((best_d, b_fp, b_cl, bx, by, angle))
-
-    candidates.sort(key=lambda c: c[0])
-    added = 0
-    for _, b_fp, b_cl, bx, by, angle in candidates:
-        if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
-            continue
-        target = None
-        target_d = float("inf")
-        for m in mvs_list:
-            if len(m["assigned_bess"]) >= max_ratio:
-                continue
-            mx, my = m["footprint"].centroid.x, m["footprint"].centroid.y
-            d = np.hypot(bx - mx, by - my)
-            if (unlimited or d <= max_cable) and d < target_d:
-                target_d = d
-                target = m
-        if target is None:
-            continue
-        bess_obj = {
-            "type":           "BESS",
-            "footprint":      b_fp,
-            "clearance_zone": b_cl,
-            "mvs":            target,
-            "angle":          angle,
-            "rotated":        angle in (90, 270),
-        }
-        placed.append(bess_obj)
-        bess_list.append(bess_obj)
-        target["assigned_bess"].append(bess_obj)
-        added += 1
-    return added
-
-
-def _try_add_mvs(site, non_buildable, placed, mvs_eq, fine_resolution):
-    mvs_cl_dict = mvs_eq["clearance"]
-    w, h = mvs_eq["width"], mvs_eq["height"]
-    for (mx, my) in create_candidate_grid(site, fine_resolution):
-        for angle in ORIENTATIONS:
-            mw, mh, mcl = get_oriented_dimensions(w, h, mvs_cl_dict, angle)
-            mvs_fp = create_equipment_polygon(mx, my, mw, mh)
-            mvs_cl = create_clearance_polygon(mvs_fp, mcl)
-            if is_valid_placement(mvs_fp, mvs_cl, site, non_buildable, placed):
-                return {
-                    "type":           "MVS",
-                    "footprint":      mvs_fp,
-                    "clearance_zone": mvs_cl,
-                    "assigned_bess":  [],
-                    "angle":          angle,
-                    "rotated":        angle in (90, 270),
-                }
-    return None
-
-
-def _fine_fill(site, non_buildable, placed, mvs_list, bess_list,
-               bess_eq, max_ratio, max_cable, fine_resolution):
-    fine_avail = create_candidate_grid(site, fine_resolution)
-    for obj in placed:
-        fine_avail = _prune_avail(fine_avail, obj["footprint"],
-                                  obj["clearance_zone"], bess_eq)
-    return _stragglers_pass_singlepass(
-        fine_avail, site, non_buildable, placed,
-        mvs_list, bess_list, bess_eq, max_ratio, max_cable,
-    )
-
-
-def _hyper_pack_pass(site, non_buildable, placed, mvs_list, bess_list,
-                     bess_eq, mvs_eq, max_ratio, max_cable, fine_resolution):
-    # Only keep a freshly-spawned MVS if it reaches at least this fill, so we do
-    # not dilute capacity saturation by pouring an inverter station for one BESS.
-    min_new_mvs_fill = max(2, (max_ratio + 1) // 2)
-
-    while True:
-        added = _fine_fill(site, non_buildable, placed, mvs_list, bess_list,
-                           bess_eq, max_ratio, max_cable, fine_resolution)
-        if added > 0:
-            continue
-        if not all(len(m["assigned_bess"]) >= max_ratio for m in mvs_list):
-            break
-
-        # Every existing MVS is full — try to open a new one, but make it earn
-        # its place: fill it, and revert if it cannot reach min_new_mvs_fill.
-        new_mvs = _try_add_mvs(site, non_buildable, placed, mvs_eq, fine_resolution)
-        if new_mvs is None:
-            break
-        placed.append(new_mvs)
-        mvs_list.append(new_mvs)
-        _fine_fill(site, non_buildable, placed, mvs_list, bess_list,
-                   bess_eq, max_ratio, max_cable, fine_resolution)
-
-        if len(new_mvs["assigned_bess"]) < min_new_mvs_fill:
-            for b in list(new_mvs["assigned_bess"]):
-                placed.remove(b)
-                if b in bess_list:
-                    bess_list.remove(b)
-            placed.remove(new_mvs)
-            mvs_list.remove(new_mvs)
-            break
-
-
 def _optimal_reassign(mvs_list, bess_list, max_cable, max_ratio):
     """Global min-cost BESS->MVS-slot reassignment (Hungarian, scipy-free
     fallback). Returns ``(mvs_list, bess_list, dropped)`` where ``dropped`` is
-    the count of physically-placed BESS that had no feasible MVS slot under the
-    cable cap and were therefore left unassigned (surfaced, never silent)."""
+    the count of placed BESS with no feasible MVS slot under the cable cap
+    (surfaced, never silent). Empty MVS are pruned."""
     if not mvs_list or not bess_list:
         return mvs_list, bess_list, 0
 
@@ -336,111 +209,3 @@ def _optimal_reassign(mvs_list, bess_list, max_cable, max_ratio):
     dropped = n_b - len(assigned_rows)
     mvs_list = [m for m in mvs_list if m["assigned_bess"]]
     return mvs_list, new_bess, dropped
-
-
-def place_clusters(site, non_buildable, grid, config, profile):
-    """Greedy MVS seeding + BESS cluster growth + optional straggler/hyper-pack
-    passes + global Hungarian reassignment, parameterised by a mode ``profile``.
-
-    Returns ``(mvs_list, bess_list, dropped)``.
-    """
-    mvs_eq      = config["equipment"]["MVS"]
-    bess_eq     = config["equipment"]["BESS"]
-    mvs_cl_dict = mvs_eq["clearance"]
-    min_spacing = config.get("min_mvs_spacing", 0)
-    max_ratio   = config["max_bess_per_mvs"]
-    scoring_r   = config.get("mvs_scoring_radius", 0)
-
-    base_cable    = config.get("max_cable_length", 25)
-    eff_cable     = profile["cable_cap_override"] if profile["cable_cap_override"] is not None else base_cable
-    eff_hungarian = profile["hungarian_cap_override"] if profile["hungarian_cap_override"] is not None else base_cable
-    fine_res      = profile["fine_grid_resolution"]
-
-    cx_off = bess_eq["width"]  / 2
-    cy_off = bess_eq["height"] / 2
-
-    placed    = []
-    mvs_list  = []
-    bess_list = []
-    avail     = list(grid)
-
-    while True:
-        if len(avail) < max_ratio + 1:
-            break
-
-        avail_arr = np.array([[x + cx_off, y + cy_off] for x, y in avail])
-        best = None
-        best_score = float("inf")
-
-        for (mx, my) in avail:
-            for angle in ORIENTATIONS:
-                mw, mh, mcl = get_oriented_dimensions(mvs_eq["width"], mvs_eq["height"], mvs_cl_dict, angle)
-                mvs_fp = create_equipment_polygon(mx, my, mw, mh)
-                mvs_cl = create_clearance_polygon(mvs_fp, mcl)
-                if not is_valid_placement(mvs_fp, mvs_cl, site, non_buildable, placed):
-                    continue
-
-                cx, cy = mvs_fp.centroid.x, mvs_fp.centroid.y
-                if min_spacing > 0 and any(
-                    (cx - m["footprint"].centroid.x) ** 2 + (cy - m["footprint"].centroid.y) ** 2
-                    < min_spacing ** 2
-                    for m in mvs_list
-                ):
-                    continue
-
-                score = _score_mvs(cx, cy, avail_arr, scoring_r, max_ratio)
-
-                if profile["mvs_y_band_bonus"] < 1.0 and mvs_list:
-                    tol = 1.5
-                    if any(abs(cy - m["footprint"].centroid.y) < tol for m in mvs_list):
-                        score *= profile["mvs_y_band_bonus"]
-
-                if score < best_score:
-                    best_score = score
-                    best = (mvs_fp, mvs_cl, angle)
-
-        if best is None:
-            break
-
-        mvs_fp, mvs_cl, best_angle = best
-        mvs_obj = {
-            "type":           "MVS",
-            "footprint":      mvs_fp,
-            "clearance_zone": mvs_cl,
-            "assigned_bess":  [],
-            "angle":          best_angle,
-            "rotated":        best_angle in (90, 270),
-        }
-        placed.append(mvs_obj)
-        mvs_list.append(mvs_obj)
-        avail = _prune_avail(avail, mvs_fp, mvs_cl, bess_eq)
-
-        added, avail = _grow_cluster(
-            mvs_obj, avail, site, non_buildable, placed, bess_eq,
-            max_ratio, eff_cable,
-            profile["alignment_weight"],
-            profile["require_adjacency"],
-        )
-        bess_list.extend(added)
-
-        if not mvs_obj["assigned_bess"]:
-            placed.remove(mvs_obj)
-            mvs_list.remove(mvs_obj)
-
-    if profile["do_stragglers"] and mvs_list:
-        avail = _stragglers_pass(
-            avail, site, non_buildable, placed, mvs_list, bess_list,
-            bess_eq, max_ratio, eff_cable,
-        )
-
-    if fine_res is not None and mvs_list:
-        _hyper_pack_pass(
-            site, non_buildable, placed, mvs_list, bess_list,
-            bess_eq, mvs_eq, max_ratio, eff_cable, fine_res,
-        )
-
-    dropped = 0
-    if mvs_list:
-        mvs_list, bess_list, dropped = _optimal_reassign(mvs_list, bess_list, eff_hungarian, max_ratio)
-
-    return mvs_list, bess_list, dropped

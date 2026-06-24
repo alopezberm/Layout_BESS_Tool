@@ -3,12 +3,23 @@
 import plotly.graph_objects as go
 
 
+def _as_polygons(geom):
+    """Constituent Polygons of a Polygon or MultiPolygon (prepare_site may
+    return a MultiPolygon when a restricted zone splits the site)."""
+    if geom.is_empty:
+        return []
+    if geom.geom_type == "MultiPolygon":
+        return list(geom.geoms)
+    return [geom]
+
+
 def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=None):
     fig = go.Figure()
 
     if not site.is_empty:
-        x, y = site.exterior.xy
-        fig.add_trace(go.Scatter(x=list(x), y=list(y), mode='lines', line=dict(color='black', width=2), name="Site Boundary", hoverinfo='skip'))
+        for poly in _as_polygons(site):
+            x, y = poly.exterior.xy
+            fig.add_trace(go.Scatter(x=list(x), y=list(y), mode='lines', line=dict(color='black', width=2), name="Site Boundary", hoverinfo='skip'))
 
     for zone in non_buildable:
         if not zone.is_empty:

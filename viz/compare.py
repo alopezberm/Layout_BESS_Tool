@@ -6,7 +6,7 @@ from core.sizing import size_system
 def print_comparison(config, *results):
     """Print a side-by-side metrics table. ``config`` supplies the per-unit
     MWh / MW ratings used for plant sizing; ``results`` are the dicts returned
-    by ``run_bess_optimization``."""
+    by ``run_row_packing`` / ``run_colocated_optimization``."""
     bess_cap = config.get("bess_unit_mwh", 5.0)
     mvs_pow  = config.get("mvs_station_mw", 2.5)
 
@@ -27,10 +27,8 @@ def print_comparison(config, *results):
         ("Capacity Sat.",     lambda m: f"{m['capacity_saturation_pct']:.1f}%"),
     ]
     pretty = {
-        "conservative":     "Conservative",
-        "aggressive":       "Aggressive",
-        "ultra_aggressive": "Ultra-Aggressive",
-        "hyper_pack":       "Hyper-Pack",
+        "row_pack":  "Row Pack",
+        "colocated": "Co-Located",
     }
     headers = ["Metric"] + [pretty.get(r["mode"], r["mode"]) for r in results]
     col_w = 20
