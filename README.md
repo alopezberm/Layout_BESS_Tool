@@ -18,11 +18,11 @@ The project is split into a headless core, a rendering layer, and two thin
 front-ends (notebook + app) that share the core verbatim — no duplicated logic.
 
 ```
-core/   layout & calculations (no UI, no plotting deps)
-viz/    matplotlib + plotly + text rendering (imports core)
-app/    Streamlit UI wrapper (imports core + viz)
-notebook/  engineering notebook (imports core + viz)
-tests/  invariant tests
+core/         layout & calculations (no UI, no plotting deps)
+viz/          matplotlib + plotly + text rendering (imports core)
+app/          Streamlit UI wrapper (imports core + viz)
+Layout.ipynb  engineering notebook at the repo root (imports core + viz)
+tests/        invariant tests
 ```
 
 | Path | Role |
@@ -37,7 +37,7 @@ tests/  invariant tests
 | [`core/optimize.py`](core/optimize.py) | `run_bess_optimization` / `run_colocated_optimization` + `MODE_PROFILES`. |
 | [`viz/`](viz/) | `matplotlib_plots`, `plotly_plots`, `compare` (text table). |
 | [`app/app.py`](app/app.py) | Streamlit UI — three-phase workflow; widgets → `build_config` → core → viz. |
-| [`notebook/Layout.ipynb`](notebook/Layout.ipynb) | Standalone engineering notebook, no app dependency. |
+| [`Layout.ipynb`](Layout.ipynb) | Standalone engineering notebook at the repo root, no app dependency. |
 | [`tests/test_engine.py`](tests/test_engine.py) | Invariant tests (no overlaps, capacity, in-bounds, sizing). |
 
 ## Algorithmic Highlights
@@ -104,7 +104,7 @@ results = [run_bess_optimization(CONFIG, mode=m, verbose=False) for m in modes]
 print_comparison(CONFIG, *results)
 ```
 
-The standalone notebook lives at [`notebook/Layout.ipynb`](notebook/Layout.ipynb)
+The standalone notebook lives at [`Layout.ipynb`](Layout.ipynb) (repo root)
 and depends only on `core` + `viz` (no app).
 
 ### 2. Interactive — the Streamlit application

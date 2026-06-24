@@ -5,6 +5,7 @@ import matplotlib.patches as mpatches
 
 from core.geometry import create_clearance_polygon
 from core.metrics import total_cable_length
+from core.sizing import size_system
 
 DEFAULT_STANDALONE_FIGSIZE = (10, 14)
 DEFAULT_PANEL_FIGSIZE      = (7, 10)
@@ -116,14 +117,24 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
         plt.tight_layout()
 
 
-def _scenario_title(res):
+def _scenario_title(res, config=None):
     m = res["metrics"]
-    return (
+    title = (
         f"{res['mode'].replace('_', ' ').upper()} — "
         f"{m['mvs_count']} MVS | {m['bess_count']} BESS | "
         f"Cable {m['total_cable']:.0f} m | "
         f"Area sat {m['area_saturation_pct']:.1f}%"
     )
+    if config is not None:
+        s = size_system(
+            m["bess_count"], m["mvs_count"],
+            config.get("bess_unit_mwh", 5.0), config.get("mvs_station_mw", 2.5),
+        )
+        title += (
+            f"\n{s['total_mw']:.1f} MW | {s['total_mwh']:.1f} MWh | "
+            f"{s['duration_label']} duration"
+        )
+    return title
 
 
 def _grid_shape(n):
@@ -146,7 +157,7 @@ def plot_comparison(*results, config, panel_size=DEFAULT_PANEL_FIGSIZE):
         plot_layout(
             res["site"], res["non_buildable"],
             res["mvs_list"], res["bess_list"],
-            config, ax=ax, title=_scenario_title(res),
+            config, ax=ax, title=_scenario_title(res, config),
         )
     for ax in axes_flat[len(results):]:
         ax.axis("off")
@@ -159,7 +170,7 @@ def plot_individual(result, config, figsize=DEFAULT_STANDALONE_FIGSIZE):
         result["site"], result["non_buildable"],
         result["mvs_list"], result["bess_list"],
         config,
-        title=_scenario_title(result),
+        title=_scenario_title(result, config),
         figsize=figsize,
     )
     plt.show()
