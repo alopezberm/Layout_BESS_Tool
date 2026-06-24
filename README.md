@@ -14,13 +14,31 @@ What is traditionally a manual, multi-day CAD exercise is reduced to a parametri
 
 ## Repository Layout
 
-| File | Role |
+The project is split into a headless core, a rendering layer, and two thin
+front-ends (notebook + app) that share the core verbatim — no duplicated logic.
+
+```
+core/   layout & calculations (no UI, no plotting deps)
+viz/    matplotlib + plotly + text rendering (imports core)
+app/    Streamlit UI wrapper (imports core + viz)
+notebook/  engineering notebook (imports core + viz)
+tests/  invariant tests
+```
+
+| Path | Role |
 | :--- | :--- |
-| [`engine.py`](engine.py) | Headless mathematical core. Polygon handling (`shapely`), clearance generation, multi-pass placement heuristics, and the Hungarian-algorithm global cable reassignment (`scipy.optimize.linear_sum_assignment`). |
-| [`visualization.py`](visualization.py) | Rendering module. Static layouts via `matplotlib` (single, panel comparison) and interactive Plotly figures with hover metadata, click-selection and PNG export. |
-| [`app.py`](app.py) | Streamlit application — three-phase UI (site definition → multi-mode benchmarking → interactive deep-dive and CSV export). |
-| [`Layout.ipynb`](Layout.ipynb) | Notebook entry point for scripted, head-to-head scenario comparisons. |
-| [`tests/test_engine.py`](tests/test_engine.py) | Smoke test driving the engine off the notebook's `CONFIG`. |
+| [`core/config.py`](core/config.py) | Single source of truth: `DEFAULT_EQUIPMENT` + `build_config()`. Both modes build CONFIG here so they can never diverge. |
+| [`core/geometry.py`](core/geometry.py) | Polygon handling (`shapely`), candidate grids, clearance generation, rotation, placement validity. |
+| [`core/placement.py`](core/placement.py) | Multi-pass greedy placement heuristics + Hungarian global cable reassignment. |
+| [`core/colocation.py`](core/colocation.py) | Co-located / paired-MVS hub engine (facility-location + hub-balanced assignment). |
+| [`core/metrics.py`](core/metrics.py) | Layout KPIs and hub/civil-works metrics. |
+| [`core/sizing.py`](core/sizing.py) | System sizing: total MW / MWh and 2H / 3H / 4H duration classification. |
+| [`core/serialization.py`](core/serialization.py) | Layout ⇄ DataFrame round-trip and non-corrupting CSV export. |
+| [`core/optimize.py`](core/optimize.py) | `run_bess_optimization` / `run_colocated_optimization` + `MODE_PROFILES`. |
+| [`viz/`](viz/) | `matplotlib_plots`, `plotly_plots`, `compare` (text table). |
+| [`app/app.py`](app/app.py) | Streamlit UI — three-phase workflow; widgets → `build_config` → core → viz. |
+| [`notebook/Layout.ipynb`](notebook/Layout.ipynb) | Standalone engineering notebook, no app dependency. |
+| [`tests/test_engine.py`](tests/test_engine.py) | Invariant tests (no overlaps, capacity, in-bounds, sizing). |
 
 ## Algorithmic Highlights
 
@@ -51,31 +69,31 @@ pip install numpy shapely scipy matplotlib plotly streamlit pandas
 
 ### 1. Programmatic — the engine in a script or notebook
 
-```python
-from engine import run_bess_optimization
-from visualization import plot_individual, print_comparison
+`build_config` is the single config constructor (equipment defaults to the
+mandated `DEFAULT_EQUIPMENT`); the notebook and the app both use it.
 
-CONFIG = {
-    "site_vertices": [(0, 0), (53.3, 0), (53.3, 90.4), (0, 90.4)],
-    "setback": 0,
-    "zones": {"non_buildable": [], "restricted": []},
-    "equipment": {
-        "BESS": {
-            "width": 6.06, "height": 2.44,
-            "clearance": {"front": 2.0, "back": 1.0, "left": 1.0, "right": 1.0},
-        },
-        "MVS": {
-            "width": 6.06, "height": 2.44,
-            "clearance": {"front": 3.0, "back": 1.5, "left": 1.5, "right": 1.5},
-        },
-    },
-    "max_bess_per_mvs": 4,
-    "max_cable_length": 25,
-    "grid_resolution": 2.0,
-}
+```python
+from core import build_config, run_bess_optimization, size_system
+from viz import plot_individual, print_comparison
+
+CONFIG = build_config(
+    site_vertices=[(0, 0), (53.3, 0), (53.3, 90.4), (0, 90.4)],
+    non_buildable=[],
+    restricted=[],
+    max_bess_per_mvs=4,
+    max_cable_length=25,
+    grid_resolution=2.0,
+    bess_unit_mwh=5.0,
+    mvs_station_mw=2.5,
+)
 
 result = run_bess_optimization(CONFIG, mode="hyper_pack", verbose=True)
 plot_individual(result, CONFIG)
+
+# System sizing: total MW / MWh and 2H / 3H / 4H duration class.
+m = result["metrics"]
+print(size_system(m["bess_count"], m["mvs_count"],
+                  CONFIG["bess_unit_mwh"], CONFIG["mvs_station_mw"]))
 ```
 
 To benchmark several strategies on the same site:
@@ -86,10 +104,13 @@ results = [run_bess_optimization(CONFIG, mode=m, verbose=False) for m in modes]
 print_comparison(CONFIG, *results)
 ```
 
+The standalone notebook lives at [`notebook/Layout.ipynb`](notebook/Layout.ipynb)
+and depends only on `core` + `viz` (no app).
+
 ### 2. Interactive — the Streamlit application
 
 ```bash
-streamlit run app.py
+streamlit run app/app.py
 ```
 
 The app exposes a three-phase workflow:
@@ -113,6 +134,10 @@ Benchmark results are cached per input hash, so re-entering Phase 2 with unchang
 | `max_bess_per_mvs` | Capacity cap for each MVS cluster. |
 | `max_cable_length` | Maximum Euclidean BESS-to-MVS distance (set to `0` to disable). |
 | `grid_resolution` | Coarse seeding grid spacing (metres). |
+| `mvs_scoring_radius` | Radius used to score candidate MVS positions by nearby demand. |
+| `min_mvs_spacing` | Minimum centre-to-centre spacing between MVS stations. |
+| `bess_unit_mwh` / `mvs_station_mw` | Per-unit ratings used by `core.sizing.size_system`. |
+| `colocation` | Co-located/hub parameters (`group_size`, `pad_gap`, `balance_tolerance`, `hub_search_radius`, `target_hub_count`). |
 
 ## Output
 
@@ -126,10 +151,13 @@ Benchmark results are cached per input hash, so re-entering Phase 2 with unchang
 ## Tests
 
 ```bash
-python -m tests.test_engine
+python -m pytest tests/ -q        # or: python tests/test_engine.py
 ```
 
-The smoke test loads the configuration defined in `Layout.ipynb` and runs the `conservative` and `hyper_pack` modes end-to-end, printing the metrics block for each.
+The suite runs every mode (plus the co-located engine) end-to-end on the
+default site and asserts the invariants any valid layout must satisfy: no
+footprint/clearance overlaps, per-MVS capacity respected, all equipment inside
+the site and out of non-buildable zones, and sane 2H/3H/4H sizing.
 
 ## Roadmap
 

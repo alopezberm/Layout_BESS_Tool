@@ -1,20 +1,35 @@
-import streamlit as st
-import pandas as pd
+"""Streamlit UI — a thin interface layer over the shared `core` engine.
+
+All layout maths, sizing and (de)serialization live in `core`; all rendering in
+`viz`. This file only collects widget values, calls `build_config(...)`, runs the
+engine and draws the results. No optimization logic lives here.
+"""
+
+import os
+import sys
 import ast
 import hashlib
 
-from engine import (
+# Allow `streamlit run app/app.py` from the repo root to import the packages.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import streamlit as st
+import pandas as pd
+
+from core import (
+    build_config,
     run_bess_optimization,
-    _compute_metrics,
+    run_colocated_optimization,
+    compute_metrics,
     create_site,
     prepare_site,
-    get_rotated_dimensions,
-    create_equipment_polygon,
-    create_clearance_polygon,
-    is_valid_placement,
-    run_colocated_optimization
+    size_system,
+    engine_to_df,
+    engine_to_df_with_hubs,
+    df_to_engine,
+    layout_to_csv,
 )
-from visualization import plot_layout_plotly, plot_layout_plotly_hubs
+from viz import plot_layout_plotly, plot_layout_plotly_hubs
 
 st.set_page_config(page_title="BESS-Opt Engine", layout="wide")
 
@@ -36,127 +51,30 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize session state cache
-if "phase" not in st.session_state:
-    st.session_state["phase"] = 1
-if "benchmark_results" not in st.session_state:
-    st.session_state["benchmark_results"] = {}
-if "selected_id" not in st.session_state:
-    st.session_state["selected_id"] = None
-if "active_mode" not in st.session_state:
-    st.session_state["active_mode"] = None
-if "colocated_results" not in st.session_state:
-    st.session_state["colocated_results"] = None
-if "colocated_config" not in st.session_state:
-    st.session_state["colocated_config"] = None
+for key, default in [
+    ("phase", 1),
+    ("benchmark_results", {}),
+    ("selected_id", None),
+    ("active_mode", None),
+    ("colocated_results", None),
+    ("colocated_config", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# =========================================================
-# HELPERS
-# =========================================================
-def engine_to_df(mvs_list, bess_list):
-    rows = []
-    mvs_map = {id(m): f"M{i+1}" for i, m in enumerate(mvs_list)}
-    for i, m in enumerate(mvs_list):
-        rows.append({
-            "ID": mvs_map[id(m)],
-            "Type": "MVS",
-            "X": float(m["footprint"].bounds[0]),
-            "Y": float(m["footprint"].bounds[1]),
-            "Rotated": bool(m.get("rotated", False)),
-            "Assigned_MVS": None
-        })
-    for i, b in enumerate(bess_list):
-        assigned_m = mvs_map.get(id(b["mvs"]), None) if "mvs" in b else None
-        rows.append({
-            "ID": f"B{i+1}",
-            "Type": "BESS",
-            "X": float(b["footprint"].bounds[0]),
-            "Y": float(b["footprint"].bounds[1]),
-            "Rotated": bool(b.get("rotated", False)),
-            "Assigned_MVS": assigned_m
-        })
-    return pd.DataFrame(rows)
-
-def engine_to_df_with_hubs(mvs_list, bess_list):
-    """Co-located export: the standard DataFrame plus a Hub_ID column that ties
-    each MVS (and each BESS, via its parent MVS) to its shared foundation pad."""
-    df = engine_to_df(mvs_list, bess_list)
-    mvs_hub = {f"M{i+1}": (m.get("hub_id") or "") for i, m in enumerate(mvs_list)}
-
-    def _hub_for(row):
-        if row["Type"] == "MVS":
-            return mvs_hub.get(row["ID"], "")
-        return mvs_hub.get(row["Assigned_MVS"], "")
-
-    df["Hub_ID"] = df.apply(_hub_for, axis=1)
-    return df
-
-def df_to_engine(df, config, site, non_buildable):
-    mvs_list = []
-    bess_list = []
-    placed = []
-    errors = []
-
-    bess_eq = config["equipment"]["BESS"]
-    mvs_eq = config["equipment"]["MVS"]
-
-    mvs_df = df[df["Type"] == "MVS"]
-    mvs_map = {}
-    for _, row in mvs_df.iterrows():
-        rotated = bool(row["Rotated"])
-        w, h, cl = get_rotated_dimensions(mvs_eq["width"], mvs_eq["height"], mvs_eq["clearance"], rotated)
-        fp = create_equipment_polygon(row["X"], row["Y"], w, h)
-        cl_poly = create_clearance_polygon(fp, cl)
-
-        mvs_obj = {
-            "type": "MVS",
-            "footprint": fp,
-            "clearance_zone": cl_poly,
-            "assigned_bess": [],
-            "rotated": rotated,
-            "id": row["ID"]
-        }
-
-        valid = is_valid_placement(fp, cl_poly, site, non_buildable, placed)
-        if not valid:
-            errors.append(f"Collision Detected: MVS {row['ID']} overlaps with obstacles/equipment or goes out of bounds.")
-
-        mvs_list.append(mvs_obj)
-        placed.append(mvs_obj)
-        mvs_map[row["ID"]] = mvs_obj
-
-    bess_df = df[df["Type"] == "BESS"]
-    for _, row in bess_df.iterrows():
-        rotated = bool(row["Rotated"])
-        w, h, cl = get_rotated_dimensions(bess_eq["width"], bess_eq["height"], bess_eq["clearance"], rotated)
-        fp = create_equipment_polygon(row["X"], row["Y"], w, h)
-        cl_poly = create_clearance_polygon(fp, cl)
-
-        assigned_mvs_id = row["Assigned_MVS"]
-        assigned_mvs = mvs_map.get(assigned_mvs_id, None)
-
-        bess_obj = {
-            "type": "BESS",
-            "footprint": fp,
-            "clearance_zone": cl_poly,
-            "mvs": assigned_mvs,
-            "rotated": rotated,
-            "id": row["ID"]
-        }
-
-        if assigned_mvs:
-            assigned_mvs["assigned_bess"].append(bess_obj)
-
-        valid = is_valid_placement(fp, cl_poly, site, non_buildable, placed)
-        if not valid:
-            errors.append(f"Collision Detected: BESS {row['ID']} overlaps with obstacles/equipment or goes out of bounds.")
-
-        bess_list.append(bess_obj)
-        placed.append(bess_obj)
-
-    return mvs_list, bess_list, errors
 
 def get_hash(state_str):
     return hashlib.sha256(state_str.encode()).hexdigest()
+
+
+def parse_zone(text):
+    """Parse a zone text area into a list of polygons. Accepts a single polygon
+    or a list of polygons; blank -> []."""
+    text = text.strip()
+    if not text:
+        return []
+    return [ast.literal_eval(text)]
+
 
 # Shared default site geometry (also used to pre-fill the co-located tab)
 DEFAULT_SITE_VERTICES  = "[(0, 0), (53.3, 0), (53.3, 16), (21.9, 16), (47.7, 90.4), (8, 90.4), (0, 90.4)]"
@@ -193,6 +111,26 @@ with st.sidebar:
     bess_cap = st.slider("BESS Unit Capacity (MWh)", 0.0, 15.0, 5.0, 0.5)
     mvs_pow = st.slider("MVS Station Power (MW)", 0.0, 15.0, 2.5, 0.5)
 
+BESS_CLEARANCE = {"front": b_front, "back": b_back, "left": b_left, "right": b_right}
+MVS_CLEARANCE  = {"front": m_front, "back": m_back, "left": m_left, "right": m_right}
+
+
+def make_config(site_vertices, non_buildable, restricted, colocation=None):
+    """Single config builder for both tabs — delegates to core.build_config so
+    the app can never diverge from the notebook."""
+    return build_config(
+        site_vertices,
+        non_buildable=non_buildable,
+        restricted=restricted,
+        bess_clearance=BESS_CLEARANCE,
+        mvs_clearance=MVS_CLEARANCE,
+        max_bess_per_mvs=max_bess,
+        bess_unit_mwh=bess_cap,
+        mvs_station_mw=mvs_pow,
+        colocation=colocation,
+    )
+
+
 # ---------------------------------------------------------
 # TOP-LEVEL WORKFLOW TABS
 # ---------------------------------------------------------
@@ -206,15 +144,11 @@ with tab_standard:
     # PHASE 1: INPUT VIEW
     # ---------------------------------------------------------
     if st.session_state["phase"] == 1:
-        default_site = DEFAULT_SITE_VERTICES
-        default_cable = DEFAULT_NONBUILD_ZONE
-        default_restrict = DEFAULT_RESTRICT_ZONE
-
         with st.expander("Step 1: Site Boundary & Zone Definitions", expanded=True):
             st.markdown("Define the exact coordinate vertices (X, Y tuples) for the physical site.")
-            site_input = st.text_area("Global Property Boundary", value=default_site, help="The outermost perimeter where equipment can be placed.")
-            non_buildable_input = st.text_area("Non-Buildable Zones", value=default_cable, help="Areas reserved for access roads, environmental restrictions, or buffer corridors where no hardware can be placed.")
-            restricted_input = st.text_area("Restricted / Out of Scope Zones", value=default_restrict, help="Additional zones completely excluded from evaluation.")
+            site_input = st.text_area("Global Property Boundary", value=DEFAULT_SITE_VERTICES, help="The outermost perimeter where equipment can be placed.")
+            non_buildable_input = st.text_area("Non-Buildable Zones", value=DEFAULT_NONBUILD_ZONE, help="Areas reserved for access roads, environmental restrictions, or buffer corridors where no hardware can be placed.")
+            restricted_input = st.text_area("Restricted / Out of Scope Zones", value=DEFAULT_RESTRICT_ZONE, help="Additional zones completely excluded from evaluation.")
 
         st.session_state["site_input"] = site_input
         st.session_state["non_buildable_input"] = non_buildable_input
@@ -233,37 +167,15 @@ with tab_standard:
     if st.session_state["phase"] >= 2:
         try:
             site_vertices = ast.literal_eval(st.session_state["site_input"])
-            nb_str = st.session_state["non_buildable_input"].strip()
-            r_str = st.session_state["restricted_input"].strip()
-            non_buildable_vertices = [ast.literal_eval(nb_str)] if nb_str else []
-            restricted_vertices = [ast.literal_eval(r_str)] if r_str else []
+            non_buildable_vertices = parse_zone(st.session_state["non_buildable_input"])
+            restricted_vertices = parse_zone(st.session_state["restricted_input"])
+            CONFIG = make_config(site_vertices, non_buildable_vertices, restricted_vertices)
         except Exception as e:
             st.error(f"Error parsing coordinates: {e}")
             if st.button("⬅️ Back"):
                 st.session_state["phase"] = 1
                 st.rerun()
             st.stop()
-
-        CONFIG = {
-            "site_vertices": site_vertices,
-            "setback": 0,
-            "zones": {"non_buildable": non_buildable_vertices, "restricted": restricted_vertices},
-            "equipment": {
-                "BESS": {
-                    "width": 6.06, "height": 2.44,
-                    "clearance": {"front": b_front, "back": b_back, "left": b_left, "right": b_right}
-                },
-                "MVS": {
-                    "width": 6.06, "height": 2.44,
-                    "clearance": {"front": m_front, "back": m_back, "left": m_left, "right": m_right}
-                }
-            },
-            "max_bess_per_mvs": max_bess,
-            "max_cable_length": 25,
-            "grid_resolution": 2.0,
-            "bess_unit_mwh": bess_cap,
-            "mvs_station_mw": mvs_pow
-        }
 
     # ---------------------------------------------------------
     # PHASE 2: BENCHMARKING GRID
@@ -276,48 +188,52 @@ with tab_standard:
 
         state_str = f"{st.session_state['site_input']}|{st.session_state['non_buildable_input']}|{st.session_state['restricted_input']}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{max_bess}"
         cache_key = get_hash(state_str)
+        modes = ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"]
 
         if cache_key not in st.session_state["benchmark_results"]:
             st.session_state["benchmark_results"][cache_key] = {}
-            modes = ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"]
 
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            for i, mode in enumerate(modes):
-                status_text.text(f"Calculating {mode.replace('_', ' ').title()} layout...")
-                res = run_bess_optimization(CONFIG, mode=mode, verbose=False)
-
-                site_raw = create_site(CONFIG["site_vertices"])
-                site, non_buildable = prepare_site(site_raw, CONFIG)
-                metrics = _compute_metrics(site, non_buildable, res["mvs_list"], res["bess_list"], max_bess)
-
-                st.session_state["benchmark_results"][cache_key][mode] = {
-                    "df": engine_to_df(res["mvs_list"], res["bess_list"]),
-                    "metrics": metrics
-                }
-                progress_bar.progress((i + 1) / len(modes))
+            try:
+                for i, mode in enumerate(modes):
+                    status_text.text(f"Calculating {mode.replace('_', ' ').title()} layout...")
+                    res = run_bess_optimization(CONFIG, mode=mode, verbose=False)
+                    st.session_state["benchmark_results"][cache_key][mode] = {
+                        "df": engine_to_df(res["mvs_list"], res["bess_list"]),
+                        "metrics": res["metrics"],
+                    }
+                    progress_bar.progress((i + 1) / len(modes))
+            except Exception as e:
+                del st.session_state["benchmark_results"][cache_key]
+                status_text.empty()
+                progress_bar.empty()
+                st.error(f"Optimization failed (check the site geometry): {e}")
+                st.stop()
 
             status_text.empty()
             progress_bar.empty()
 
         results = st.session_state["benchmark_results"][cache_key]
-        modes = ["conservative", "aggressive", "ultra_aggressive", "hyper_pack"]
         cols = st.columns(4)
 
         for i, mode in enumerate(modes):
             with cols[i]:
                 st.markdown(f"### {mode.replace('_', ' ').title()}")
                 metrics = results[mode]["metrics"]
-                total_energy = metrics["bess_count"] * bess_cap
-                total_power = metrics["mvs_count"] * mvs_pow
+                sizing = size_system(metrics["bess_count"], metrics["mvs_count"], bess_cap, mvs_pow)
 
                 st.metric("Total BESS", metrics["bess_count"])
                 st.metric("Total MVS", metrics["mvs_count"])
-                st.metric("Plant Energy (MWh)", f"{total_energy:.1f}")
-                st.metric("Plant Power (MW)", f"{total_power:.1f}")
+                st.metric("Plant Energy (MWh)", f"{sizing['total_mwh']:.1f}")
+                st.metric("Plant Power (MW)", f"{sizing['total_mw']:.1f}")
+                st.metric("Duration", sizing["duration_label"])
                 st.metric("Total Cable (m)", f"{metrics['total_cable']:.1f}")
                 st.metric("Area Saturation", f"{metrics['area_saturation_pct']:.1f}%")
+
+                if metrics.get("dropped_bess"):
+                    st.warning(f"{metrics['dropped_bess']} BESS unassigned (cable cap).")
 
                 if st.button(f"🔎 Select {mode.replace('_', ' ').title()}", key=f"select_{mode}", use_container_width=True):
                     st.session_state["active_mode"] = mode
@@ -353,7 +269,6 @@ with tab_standard:
             fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, CONFIG, title=f"Interactive Layout: {mode_title}")
             fig.update_layout(dragmode='pan')
 
-            # Ensure toImage button is always active
             plotly_config = {
                 'scrollZoom': True,
                 'toImageButtonOptions': {'format': 'png', 'filename': f'bess_layout_{mode_title}', 'height': 1080, 'width': 1920}
@@ -368,9 +283,8 @@ with tab_standard:
                     st.rerun()
 
         with col_data:
-            metrics = _compute_metrics(site, non_buildable, mvs_list, bess_list, CONFIG["max_bess_per_mvs"])
-            total_energy = metrics["bess_count"] * bess_cap
-            total_power = metrics["mvs_count"] * mvs_pow
+            metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, CONFIG["max_bess_per_mvs"])
+            sizing = size_system(metrics["bess_count"], metrics["mvs_count"], bess_cap, mvs_pow)
 
             kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
             kpi_col1.metric("MVS Placed", metrics["mvs_count"])
@@ -379,8 +293,10 @@ with tab_standard:
 
             kpi_col4, kpi_col5, kpi_col6 = st.columns(3)
             kpi_col4.metric("Total Cable", f"{metrics['total_cable']:.1f} m")
-            kpi_col5.metric("Total Energy", f"{total_energy:.1f} MWh")
-            kpi_col6.metric("Total Power", f"{total_power:.1f} MW")
+            kpi_col5.metric("Total Energy", f"{sizing['total_mwh']:.1f} MWh")
+            kpi_col6.metric("Total Power", f"{sizing['total_mw']:.1f} MW")
+
+            st.caption(f"Storage duration: **{sizing['duration_label']}** ({sizing['duration_h']:.1f} h)")
 
             st.markdown("---")
             st.markdown("### Component Control Panel")
@@ -455,9 +371,11 @@ with tab_standard:
             export_df.loc[export_df["Type"] == "MVS", "Power (MW)"] = mvs_pow
             export_df.loc[export_df["Type"] == "BESS", "Power (MW)"] = 0.0
 
-            csv_str = export_df.to_csv(index=False)
-            summary_lines = f"\n\nTotal Plant Power: {total_power:.1f} MW\nTotal Plant Energy: {total_energy:.1f} MWh\n"
-            csv_str += summary_lines
+            csv_str = layout_to_csv(export_df, summary={
+                "Total Plant Power (MW)": f"{sizing['total_mw']:.1f}",
+                "Total Plant Energy (MWh)": f"{sizing['total_mwh']:.1f}",
+                "Storage Duration": sizing["duration_label"],
+            })
 
             st.download_button(
                 label="📥 Download Engineering Report (CSV)",
@@ -520,34 +438,15 @@ with tab_colocated:
     if run_co:
         try:
             c_site_vertices = ast.literal_eval(c_site_input)
-            c_nb = c_nb_input.strip()
-            c_r = c_r_input.strip()
-            c_nb_vertices = [ast.literal_eval(c_nb)] if c_nb else []
-            c_r_vertices = [ast.literal_eval(c_r)] if c_r else []
+            c_nb_vertices = parse_zone(c_nb_input)
+            c_r_vertices = parse_zone(c_r_input)
         except Exception as e:
             st.error(f"Error parsing coordinates: {e}")
             st.stop()
 
-        CO_CONFIG = {
-            "site_vertices": c_site_vertices,
-            "setback": 0,
-            "zones": {"non_buildable": c_nb_vertices, "restricted": c_r_vertices},
-            "equipment": {
-                "BESS": {
-                    "width": 6.06, "height": 2.44,
-                    "clearance": {"front": b_front, "back": b_back, "left": b_left, "right": b_right}
-                },
-                "MVS": {
-                    "width": 6.06, "height": 2.44,
-                    "clearance": {"front": m_front, "back": m_back, "left": m_left, "right": m_right}
-                }
-            },
-            "max_bess_per_mvs": max_bess,
-            "max_cable_length": 25,
-            "grid_resolution": 2.0,
-            "bess_unit_mwh": bess_cap,
-            "mvs_station_mw": mvs_pow,
-            "colocation": {
+        CO_CONFIG = make_config(
+            c_site_vertices, c_nb_vertices, c_r_vertices,
+            colocation={
                 "enabled": True,
                 "group_size": int(group_size),
                 "pad_gap": float(pad_gap),
@@ -555,13 +454,16 @@ with tab_colocated:
                 "hub_search_radius": float(hub_radius),
                 "target_hub_count": int(target_hubs),
             },
-        }
+        )
 
-        with st.spinner("Solving facility-location hubs and hub-balanced cable assignment..."):
-            co_res = run_colocated_optimization(CO_CONFIG, mode=co_mode, verbose=False)
-
-        st.session_state["colocated_results"] = co_res
-        st.session_state["colocated_config"] = CO_CONFIG
+        try:
+            with st.spinner("Solving facility-location hubs and hub-balanced cable assignment..."):
+                co_res = run_colocated_optimization(CO_CONFIG, mode=co_mode, verbose=False)
+            st.session_state["colocated_results"] = co_res
+            st.session_state["colocated_config"] = CO_CONFIG
+        except Exception as e:
+            st.error(f"Co-located optimization failed (check the site geometry): {e}")
+            st.stop()
 
     if st.session_state["colocated_results"] is not None:
         co_res = st.session_state["colocated_results"]
@@ -585,8 +487,7 @@ with tab_colocated:
             st.plotly_chart(fig, use_container_width=True, config=plotly_config)
 
         with co_data:
-            total_energy = co_metrics["bess_count"] * bess_cap
-            total_power = co_metrics["mvs_count"] * mvs_pow
+            sizing = size_system(co_metrics["bess_count"], co_metrics["mvs_count"], bess_cap, mvs_pow)
 
             st.markdown("### ⬡ Hub Performance")
             hk1, hk2, hk3 = st.columns(3)
@@ -609,9 +510,10 @@ with tab_colocated:
 
             st.markdown("### ⚡ Plant & Cabling")
             pk1, pk2, pk3 = st.columns(3)
-            pk1.metric("Plant Energy", f"{total_energy:.1f} MWh")
-            pk2.metric("Plant Power", f"{total_power:.1f} MW")
+            pk1.metric("Plant Energy", f"{sizing['total_mwh']:.1f} MWh")
+            pk2.metric("Plant Power", f"{sizing['total_mw']:.1f} MW")
             pk3.metric("Total Cable", f"{co_metrics['total_cable']:.1f} m")
+            st.caption(f"Storage duration: **{sizing['duration_label']}** ({sizing['duration_h']:.1f} h)")
 
             if hub_metrics["worst_hub_imbalance"] > balance_tol:
                 st.warning(
@@ -629,14 +531,14 @@ with tab_colocated:
             co_export_df.loc[co_export_df["Type"] == "MVS", "Power (MW)"] = mvs_pow
             co_export_df.loc[co_export_df["Type"] == "BESS", "Power (MW)"] = 0.0
 
-            co_csv = co_export_df.to_csv(index=False)
-            co_csv += (
-                f"\n\nHubs (Shared Pads): {hub_metrics['hub_count']}\n"
-                f"Foundation Reduction: {hub_metrics['foundation_reduction_pct']:.1f}%\n"
-                f"Hub Balance Index: {hub_metrics['balance_index']:.2f}\n"
-                f"Total Plant Power: {total_power:.1f} MW\n"
-                f"Total Plant Energy: {total_energy:.1f} MWh\n"
-            )
+            co_csv = layout_to_csv(co_export_df, summary={
+                "Hubs (Shared Pads)": hub_metrics["hub_count"],
+                "Foundation Reduction (%)": f"{hub_metrics['foundation_reduction_pct']:.1f}",
+                "Hub Balance Index": f"{hub_metrics['balance_index']:.2f}",
+                "Total Plant Power (MW)": f"{sizing['total_mw']:.1f}",
+                "Total Plant Energy (MWh)": f"{sizing['total_mwh']:.1f}",
+                "Storage Duration": sizing["duration_label"],
+            })
 
             st.download_button(
                 label="📥 Download Co-Located Engineering Report (CSV)",
