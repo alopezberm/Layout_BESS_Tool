@@ -8,7 +8,8 @@ from .geometry import (
     create_equipment_polygon,
     create_clearance_polygon,
     is_valid_placement,
-    get_rotated_dimensions,
+    get_oriented_dimensions,
+    ORIENTATIONS,
     create_candidate_grid,
 )
 
@@ -19,8 +20,8 @@ def _prune_avail(avail, blocker_fp, blocker_cl, bess_eq):
     out = []
     for (gx, gy) in avail:
         keep = False
-        for rotated in [False, True]:
-            rw, rh, rcl = get_rotated_dimensions(w, h, bess_cl_dict, rotated)
+        for angle in ORIENTATIONS:
+            rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
             b_fp = create_equipment_polygon(gx, gy, rw, rh)
             b_cl = create_clearance_polygon(b_fp, rcl)
             if not (b_fp.intersects(blocker_cl) or blocker_fp.intersects(b_cl)):
@@ -49,8 +50,8 @@ def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
         best = None
         best_score = float("inf")
         for (gx, gy) in avail:
-            for rotated in [False, True]:
-                rw, rh, rcl = get_rotated_dimensions(w, h, bess_cl_dict, rotated)
+            for angle in ORIENTATIONS:
+                rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
                 b_fp = create_equipment_polygon(gx, gy, rw, rh)
                 b_cl = create_clearance_polygon(b_fp, rcl)
                 if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
@@ -76,7 +77,7 @@ def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
                     aligned = any(
                         (abs(c["footprint"].centroid.x - bx) < tol or
                          abs(c["footprint"].centroid.y - by) < tol) and
-                        c.get("rotated", False) == rotated
+                        c.get("angle", 0) == angle
                         for c in members
                     )
                     if not aligned:
@@ -84,17 +85,18 @@ def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
 
                 if score < best_score:
                     best_score = score
-                    best = (b_fp, b_cl, rotated)
+                    best = (b_fp, b_cl, angle)
 
         if best is None:
             break
-        b_fp, b_cl, best_rotated = best
+        b_fp, b_cl, best_angle = best
         bess_obj = {
             "type":           "BESS",
             "footprint":      b_fp,
             "clearance_zone": b_cl,
             "mvs":            mvs_obj,
-            "rotated":        best_rotated
+            "angle":          best_angle,
+            "rotated":        best_angle in (90, 270),
         }
         placed.append(bess_obj)
         mvs_obj["assigned_bess"].append(bess_obj)
@@ -112,8 +114,8 @@ def _stragglers_pass(avail, site, non_buildable, placed, mvs_list, bess_list,
     while True:
         candidates = []
         for (gx, gy) in avail:
-            for rotated in [False, True]:
-                rw, rh, rcl = get_rotated_dimensions(w, h, bess_cl_dict, rotated)
+            for angle in ORIENTATIONS:
+                rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
                 b_fp = create_equipment_polygon(gx, gy, rw, rh)
                 b_cl = create_clearance_polygon(b_fp, rcl)
                 if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
@@ -131,18 +133,19 @@ def _stragglers_pass(avail, site, non_buildable, placed, mvs_list, bess_list,
                         best_mvs = m
                 if best_mvs is None:
                     continue
-                candidates.append((best_d, b_fp, b_cl, best_mvs, rotated))
+                candidates.append((best_d, b_fp, b_cl, best_mvs, angle))
 
         if not candidates:
             break
         candidates.sort(key=lambda c: c[0])
-        _, b_fp, b_cl, mvs, best_rotated = candidates[0]
+        _, b_fp, b_cl, mvs, best_angle = candidates[0]
         bess_obj = {
             "type":           "BESS",
             "footprint":      b_fp,
             "clearance_zone": b_cl,
             "mvs":            mvs,
-            "rotated":        best_rotated
+            "angle":          best_angle,
+            "rotated":        best_angle in (90, 270),
         }
         placed.append(bess_obj)
         bess_list.append(bess_obj)
@@ -159,8 +162,8 @@ def _stragglers_pass_singlepass(fine_avail, site, non_buildable, placed,
     unlimited = max_cable <= 0
     candidates = []
     for (gx, gy) in fine_avail:
-        for rotated in [False, True]:
-            rw, rh, rcl = get_rotated_dimensions(w, h, bess_cl_dict, rotated)
+        for angle in ORIENTATIONS:
+            rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
             b_fp = create_equipment_polygon(gx, gy, rw, rh)
             b_cl = create_clearance_polygon(b_fp, rcl)
             if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
@@ -174,11 +177,11 @@ def _stragglers_pass_singlepass(fine_avail, site, non_buildable, placed,
                     best_d = d
             if best_d == float("inf"):
                 continue
-            candidates.append((best_d, b_fp, b_cl, bx, by, rotated))
+            candidates.append((best_d, b_fp, b_cl, bx, by, angle))
 
     candidates.sort(key=lambda c: c[0])
     added = 0
-    for _, b_fp, b_cl, bx, by, rotated in candidates:
+    for _, b_fp, b_cl, bx, by, angle in candidates:
         if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
             continue
         target = None
@@ -198,7 +201,8 @@ def _stragglers_pass_singlepass(fine_avail, site, non_buildable, placed,
             "footprint":      b_fp,
             "clearance_zone": b_cl,
             "mvs":            target,
-            "rotated":        rotated
+            "angle":          angle,
+            "rotated":        angle in (90, 270),
         }
         placed.append(bess_obj)
         bess_list.append(bess_obj)
@@ -211,8 +215,8 @@ def _try_add_mvs(site, non_buildable, placed, mvs_eq, fine_resolution):
     mvs_cl_dict = mvs_eq["clearance"]
     w, h = mvs_eq["width"], mvs_eq["height"]
     for (mx, my) in create_candidate_grid(site, fine_resolution):
-        for rotated in [False, True]:
-            mw, mh, mcl = get_rotated_dimensions(w, h, mvs_cl_dict, rotated)
+        for angle in ORIENTATIONS:
+            mw, mh, mcl = get_oriented_dimensions(w, h, mvs_cl_dict, angle)
             mvs_fp = create_equipment_polygon(mx, my, mw, mh)
             mvs_cl = create_clearance_polygon(mvs_fp, mcl)
             if is_valid_placement(mvs_fp, mvs_cl, site, non_buildable, placed):
@@ -221,30 +225,55 @@ def _try_add_mvs(site, non_buildable, placed, mvs_eq, fine_resolution):
                     "footprint":      mvs_fp,
                     "clearance_zone": mvs_cl,
                     "assigned_bess":  [],
-                    "rotated":        rotated
+                    "angle":          angle,
+                    "rotated":        angle in (90, 270),
                 }
     return None
 
 
+def _fine_fill(site, non_buildable, placed, mvs_list, bess_list,
+               bess_eq, max_ratio, max_cable, fine_resolution):
+    fine_avail = create_candidate_grid(site, fine_resolution)
+    for obj in placed:
+        fine_avail = _prune_avail(fine_avail, obj["footprint"],
+                                  obj["clearance_zone"], bess_eq)
+    return _stragglers_pass_singlepass(
+        fine_avail, site, non_buildable, placed,
+        mvs_list, bess_list, bess_eq, max_ratio, max_cable,
+    )
+
+
 def _hyper_pack_pass(site, non_buildable, placed, mvs_list, bess_list,
                      bess_eq, mvs_eq, max_ratio, max_cable, fine_resolution):
+    # Only keep a freshly-spawned MVS if it reaches at least this fill, so we do
+    # not dilute capacity saturation by pouring an inverter station for one BESS.
+    min_new_mvs_fill = max(2, (max_ratio + 1) // 2)
+
     while True:
-        fine_avail = create_candidate_grid(site, fine_resolution)
-        for obj in placed:
-            fine_avail = _prune_avail(fine_avail, obj["footprint"],
-                                      obj["clearance_zone"], bess_eq)
-        added = _stragglers_pass_singlepass(
-            fine_avail, site, non_buildable, placed,
-            mvs_list, bess_list, bess_eq, max_ratio, max_cable,
-        )
-        if added == 0:
-            if all(len(m["assigned_bess"]) >= max_ratio for m in mvs_list):
-                new_mvs = _try_add_mvs(site, non_buildable, placed, mvs_eq, fine_resolution)
-                if new_mvs is None:
-                    break
-                placed.append(new_mvs)
-                mvs_list.append(new_mvs)
-                continue
+        added = _fine_fill(site, non_buildable, placed, mvs_list, bess_list,
+                           bess_eq, max_ratio, max_cable, fine_resolution)
+        if added > 0:
+            continue
+        if not all(len(m["assigned_bess"]) >= max_ratio for m in mvs_list):
+            break
+
+        # Every existing MVS is full — try to open a new one, but make it earn
+        # its place: fill it, and revert if it cannot reach min_new_mvs_fill.
+        new_mvs = _try_add_mvs(site, non_buildable, placed, mvs_eq, fine_resolution)
+        if new_mvs is None:
+            break
+        placed.append(new_mvs)
+        mvs_list.append(new_mvs)
+        _fine_fill(site, non_buildable, placed, mvs_list, bess_list,
+                   bess_eq, max_ratio, max_cable, fine_resolution)
+
+        if len(new_mvs["assigned_bess"]) < min_new_mvs_fill:
+            for b in list(new_mvs["assigned_bess"]):
+                placed.remove(b)
+                if b in bess_list:
+                    bess_list.remove(b)
+            placed.remove(new_mvs)
+            mvs_list.remove(new_mvs)
             break
 
 
@@ -344,8 +373,8 @@ def place_clusters(site, non_buildable, grid, config, profile):
         best_score = float("inf")
 
         for (mx, my) in avail:
-            for rotated in [False, True]:
-                mw, mh, mcl = get_rotated_dimensions(mvs_eq["width"], mvs_eq["height"], mvs_cl_dict, rotated)
+            for angle in ORIENTATIONS:
+                mw, mh, mcl = get_oriented_dimensions(mvs_eq["width"], mvs_eq["height"], mvs_cl_dict, angle)
                 mvs_fp = create_equipment_polygon(mx, my, mw, mh)
                 mvs_cl = create_clearance_polygon(mvs_fp, mcl)
                 if not is_valid_placement(mvs_fp, mvs_cl, site, non_buildable, placed):
@@ -368,18 +397,19 @@ def place_clusters(site, non_buildable, grid, config, profile):
 
                 if score < best_score:
                     best_score = score
-                    best = (mvs_fp, mvs_cl, rotated)
+                    best = (mvs_fp, mvs_cl, angle)
 
         if best is None:
             break
 
-        mvs_fp, mvs_cl, best_rotated = best
+        mvs_fp, mvs_cl, best_angle = best
         mvs_obj = {
             "type":           "MVS",
             "footprint":      mvs_fp,
             "clearance_zone": mvs_cl,
             "assigned_bess":  [],
-            "rotated":        best_rotated
+            "angle":          best_angle,
+            "rotated":        best_angle in (90, 270),
         }
         placed.append(mvs_obj)
         mvs_list.append(mvs_obj)

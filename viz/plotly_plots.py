@@ -49,7 +49,7 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
 
             # BESS Footprint
             bx, by = bess["footprint"].exterior.xy
-            rot_str = "90°" if bess.get("rotated", False) else "0°"
+            rot_str = f"{bess.get('angle', 90 if bess.get('rotated', False) else 0)}°"
             hover_text = f"ID: {bess_id}<br>Type: BESS<br>X: {bess['footprint'].bounds[0]:.1f}<br>Y: {bess['footprint'].bounds[1]:.1f}<br>Rotated: {rot_str}<br>Assigned MVS: {mvs_id}"
 
             fig.add_trace(go.Scatter(
@@ -59,7 +59,7 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
 
         # MVS Footprint
         mx, my = mvs["footprint"].exterior.xy
-        rot_str = "90°" if mvs.get("rotated", False) else "0°"
+        rot_str = f"{mvs.get('angle', 90 if mvs.get('rotated', False) else 0)}°"
         hover_text = f"ID: {mvs_id}<br>Type: MVS<br>X: {mvs['footprint'].bounds[0]:.1f}<br>Y: {mvs['footprint'].bounds[1]:.1f}<br>Rotated: {rot_str}<br>Assigned BESS: {len(mvs['assigned_bess'])}"
 
         fig.add_trace(go.Scatter(

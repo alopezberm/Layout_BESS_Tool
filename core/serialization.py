@@ -7,11 +7,21 @@ and the same collision-validated re-import. Depends on pandas + core geometry.
 import pandas as pd
 
 from .geometry import (
-    get_rotated_dimensions,
+    get_oriented_dimensions,
     create_equipment_polygon,
     create_clearance_polygon,
     is_valid_placement,
 )
+
+
+def _row_angle(row):
+    """Resolve an orientation angle (0/90/180/270) from a DataFrame row,
+    tolerating the legacy boolean ``Rotated`` column. Works for a pandas Series
+    or a plain dict (both expose ``.get``)."""
+    angle = row.get("Angle", None)
+    if angle is None or (isinstance(angle, float) and angle != angle):  # None / NaN
+        return 90 if bool(row.get("Rotated", False)) else 0
+    return int(angle) % 360
 
 
 def engine_to_df(mvs_list, bess_list):
@@ -20,22 +30,26 @@ def engine_to_df(mvs_list, bess_list):
     rows = []
     mvs_map = {id(m): f"M{i+1}" for i, m in enumerate(mvs_list)}
     for m in mvs_list:
+        angle = int(m.get("angle", 90 if m.get("rotated") else 0))
         rows.append({
             "ID": mvs_map[id(m)],
             "Type": "MVS",
             "X": float(m["footprint"].bounds[0]),
             "Y": float(m["footprint"].bounds[1]),
-            "Rotated": bool(m.get("rotated", False)),
+            "Angle": angle,
+            "Rotated": angle in (90, 270),
             "Assigned_MVS": None,
         })
     for i, b in enumerate(bess_list):
         assigned_m = mvs_map.get(id(b["mvs"]), None) if "mvs" in b and b["mvs"] else None
+        angle = int(b.get("angle", 90 if b.get("rotated") else 0))
         rows.append({
             "ID": f"B{i+1}",
             "Type": "BESS",
             "X": float(b["footprint"].bounds[0]),
             "Y": float(b["footprint"].bounds[1]),
-            "Rotated": bool(b.get("rotated", False)),
+            "Angle": angle,
+            "Rotated": angle in (90, 270),
             "Assigned_MVS": assigned_m,
         })
     return pd.DataFrame(rows)
@@ -71,8 +85,8 @@ def df_to_engine(df, config, site, non_buildable):
     mvs_df = df[df["Type"] == "MVS"]
     mvs_map = {}
     for _, row in mvs_df.iterrows():
-        rotated = bool(row["Rotated"])
-        w, h, cl = get_rotated_dimensions(mvs_eq["width"], mvs_eq["height"], mvs_eq["clearance"], rotated)
+        angle = _row_angle(row)
+        w, h, cl = get_oriented_dimensions(mvs_eq["width"], mvs_eq["height"], mvs_eq["clearance"], angle)
         fp = create_equipment_polygon(row["X"], row["Y"], w, h)
         cl_poly = create_clearance_polygon(fp, cl)
 
@@ -81,7 +95,8 @@ def df_to_engine(df, config, site, non_buildable):
             "footprint": fp,
             "clearance_zone": cl_poly,
             "assigned_bess": [],
-            "rotated": rotated,
+            "angle": angle,
+            "rotated": angle in (90, 270),
             "id": row["ID"],
         }
 
@@ -94,8 +109,8 @@ def df_to_engine(df, config, site, non_buildable):
 
     bess_df = df[df["Type"] == "BESS"]
     for _, row in bess_df.iterrows():
-        rotated = bool(row["Rotated"])
-        w, h, cl = get_rotated_dimensions(bess_eq["width"], bess_eq["height"], bess_eq["clearance"], rotated)
+        angle = _row_angle(row)
+        w, h, cl = get_oriented_dimensions(bess_eq["width"], bess_eq["height"], bess_eq["clearance"], angle)
         fp = create_equipment_polygon(row["X"], row["Y"], w, h)
         cl_poly = create_clearance_polygon(fp, cl)
 
@@ -106,7 +121,8 @@ def df_to_engine(df, config, site, non_buildable):
             "footprint": fp,
             "clearance_zone": cl_poly,
             "mvs": assigned_mvs,
-            "rotated": rotated,
+            "angle": angle,
+            "rotated": angle in (90, 270),
             "id": row["ID"],
         }
 

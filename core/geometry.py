@@ -71,12 +71,43 @@ def is_valid_placement(candidate_fp, candidate_cl, site, non_buildable, placed):
     return True
 
 
+# The four discrete orientations a container may take (degrees, CCW).
+ORIENTATIONS = (0, 90, 180, 270)
+
+
+def get_oriented_dimensions(w, h, cl_dict, angle):
+    """Return (width, height, clearance) for a container rotated by ``angle``
+    (one of 0/90/180/270 degrees).
+
+    For a rectangular footprint, 0/180 share the (w, h) bounding box and 90/270
+    share (h, w) — but the *clearance* sides differ for every angle because the
+    per-side clearances (front/back/left/right) are asymmetric. This is what
+    makes 180° meaningful: it lets a unit face its small "back" clearance toward
+    a neighbour (back-to-back packing) instead of its large "front".
+
+    Each 90° step advances the clearance values along the cycle
+    front -> right -> back -> left -> front.
+    """
+    k = (int(angle) // 90) % 4
+    rw, rh = (w, h) if k % 2 == 0 else (h, w)
+    cl = dict(cl_dict)
+    for _ in range(k):
+        cl = {
+            "front": cl["left"],
+            "right": cl["front"],
+            "back":  cl["right"],
+            "left":  cl["back"],
+        }
+    return rw, rh, cl
+
+
 def get_rotated_dimensions(w, h, cl_dict, rotated):
-    if not rotated:
-        return w, h, cl_dict
-    return h, w, {
-        "front": cl_dict["left"],
-        "back": cl_dict["right"],
-        "left": cl_dict["back"],
-        "right": cl_dict["front"],
-    }
+    """Backward-compatible boolean wrapper: False -> 0°, True -> 90°.
+
+    ``rotated`` may also be passed an angle (0/90/180/270) directly.
+    """
+    if rotated in (0, 90, 180, 270):
+        angle = rotated
+    else:
+        angle = 90 if rotated else 0
+    return get_oriented_dimensions(w, h, cl_dict, angle)

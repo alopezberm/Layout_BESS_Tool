@@ -16,7 +16,8 @@ from .geometry import (
     create_equipment_polygon,
     create_clearance_polygon,
     is_valid_placement,
-    get_rotated_dimensions,
+    get_oriented_dimensions,
+    ORIENTATIONS,
 )
 from .placement import _prune_avail
 
@@ -110,8 +111,8 @@ def _snap_hub_to_pad(center, group_size, pad_gap, site, non_buildable, placed,
 
     for dx, dy in offsets:
         cx, cy = cx0 + dx, cy0 + dy
-        for rotated in (False, True):
-            rw, rh, rcl = get_rotated_dimensions(w, h, mvs_cl, rotated)
+        for angle in ORIENTATIONS:
+            rw, rh, rcl = get_oriented_dimensions(w, h, mvs_cl, angle)
             pad_w = group_size * rw + (group_size - 1) * pad_gap
             pad_h = rh
             ax = cx - pad_w / 2.0
@@ -130,7 +131,8 @@ def _snap_hub_to_pad(center, group_size, pad_gap, site, non_buildable, placed,
                     "footprint":      fp,
                     "clearance_zone": cl,
                     "assigned_bess":  [],
-                    "rotated":        rotated,
+                    "angle":          angle,
+                    "rotated":        angle in (90, 270),
                 })
             if ok:
                 return members

@@ -323,7 +323,14 @@ with tab_standard:
                 new_x = edit_col1.number_input("X Coordinate (m)", value=float(row['X']), step=0.1)
                 new_y = edit_col2.number_input("Y Coordinate (m)", value=float(row['Y']), step=0.1)
 
-                new_rot = st.toggle("Rotate 90°", value=bool(row['Rotated']))
+                cur_angle = int(row["Angle"]) if "Angle" in editor_df.columns and pd.notna(row.get("Angle")) else (90 if bool(row.get("Rotated", False)) else 0)
+                if cur_angle not in (0, 90, 180, 270):
+                    cur_angle = 0
+                new_angle = st.selectbox(
+                    "Orientation (°) — 180°/270° enable back-to-back packing",
+                    options=[0, 90, 180, 270],
+                    index=[0, 90, 180, 270].index(cur_angle),
+                )
 
                 new_mvs = row['Assigned_MVS']
                 if row['Type'] == "BESS":
@@ -336,10 +343,11 @@ with tab_standard:
                     st.session_state["selected_id"] = None
                     st.rerun()
 
-                if new_x != row['X'] or new_y != row['Y'] or new_rot != row['Rotated'] or new_mvs != row['Assigned_MVS']:
+                if new_x != row['X'] or new_y != row['Y'] or new_angle != cur_angle or new_mvs != row['Assigned_MVS']:
                     editor_df.at[idx, 'X'] = new_x
                     editor_df.at[idx, 'Y'] = new_y
-                    editor_df.at[idx, 'Rotated'] = new_rot
+                    editor_df.at[idx, 'Angle'] = new_angle
+                    editor_df.at[idx, 'Rotated'] = new_angle in (90, 270)
                     editor_df.at[idx, 'Assigned_MVS'] = new_mvs
                     st.session_state["editor_df"] = editor_df
                     st.rerun()
@@ -352,7 +360,7 @@ with tab_standard:
             if action_col1.button("➕ Add BESS Container"):
                 new_row = pd.DataFrame([{
                     "ID": f"B_NEW_{len(editor_df)}", "Type": "BESS", "X": 25.0, "Y": 45.0,
-                    "Rotated": False, "Assigned_MVS": "M1"
+                    "Angle": 0, "Rotated": False, "Assigned_MVS": "M1"
                 }])
                 st.session_state["editor_df"] = pd.concat([editor_df, new_row], ignore_index=True)
                 st.rerun()
@@ -360,7 +368,7 @@ with tab_standard:
             if action_col2.button("⚡ Add MVS Station"):
                 new_row = pd.DataFrame([{
                     "ID": f"M_NEW_{len(editor_df)}", "Type": "MVS", "X": 25.0, "Y": 45.0,
-                    "Rotated": False, "Assigned_MVS": None
+                    "Angle": 0, "Rotated": False, "Assigned_MVS": None
                 }])
                 st.session_state["editor_df"] = pd.concat([editor_df, new_row], ignore_index=True)
                 st.rerun()

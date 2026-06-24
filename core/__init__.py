@@ -14,6 +14,8 @@ from .geometry import (
     create_clearance_polygon,
     is_valid_placement,
     get_rotated_dimensions,
+    get_oriented_dimensions,
+    ORIENTATIONS,
 )
 from .metrics import total_cable_length, compute_metrics, compute_hub_metrics
 from .sizing import size_system, classify_duration
@@ -35,6 +37,8 @@ __all__ = [
     "create_clearance_polygon",
     "is_valid_placement",
     "get_rotated_dimensions",
+    "get_oriented_dimensions",
+    "ORIENTATIONS",
     "total_cable_length",
     "compute_metrics",
     "compute_hub_metrics",

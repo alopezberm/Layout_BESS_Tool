@@ -3,7 +3,7 @@
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-from core.geometry import create_clearance_polygon
+from core.geometry import create_clearance_polygon, get_oriented_dimensions
 from core.metrics import total_cable_length
 from core.sizing import size_system
 
@@ -15,6 +15,8 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
                 ax=None, title=None, figsize=None):
     bess_cl_cfg = config["equipment"]["BESS"]["clearance"]
     mvs_cl_cfg  = config["equipment"]["MVS"]["clearance"]
+    bess_w, bess_h = config["equipment"]["BESS"]["width"], config["equipment"]["BESS"]["height"]
+    mvs_w,  mvs_h  = config["equipment"]["MVS"]["width"],  config["equipment"]["MVS"]["height"]
 
     n   = len(mvs_list)
     tab = plt.cm.tab10.colors if n <= 10 else plt.cm.tab20.colors
@@ -40,15 +42,8 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
         r, g, b = col[:3]
         dark    = (r * 0.50, g * 0.50, b * 0.50)
 
-        if mvs.get("rotated", False):
-            r_mvs_cl_cfg = {
-                "front": mvs_cl_cfg["left"],
-                "back": mvs_cl_cfg["right"],
-                "left": mvs_cl_cfg["back"],
-                "right": mvs_cl_cfg["front"],
-            }
-        else:
-            r_mvs_cl_cfg = mvs_cl_cfg
+        mvs_angle = mvs.get("angle", 90 if mvs.get("rotated", False) else 0)
+        _, _, r_mvs_cl_cfg = get_oriented_dimensions(mvs_w, mvs_h, mvs_cl_cfg, mvs_angle)
         mvs_cl_poly = create_clearance_polygon(mvs["footprint"], r_mvs_cl_cfg)
         x, y = mvs_cl_poly.exterior.xy
         ax.fill(x, y, color=col, alpha=0.12, zorder=1)
@@ -60,15 +55,8 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
                 [bess["footprint"].centroid.y, mvs["footprint"].centroid.y],
                 color=col, linewidth=1.2, alpha=0.85, zorder=2,
             )
-            if bess.get("rotated", False):
-                r_bess_cl_cfg = {
-                    "front": bess_cl_cfg["left"],
-                    "back": bess_cl_cfg["right"],
-                    "left": bess_cl_cfg["back"],
-                    "right": bess_cl_cfg["front"],
-                }
-            else:
-                r_bess_cl_cfg = bess_cl_cfg
+            bess_angle = bess.get("angle", 90 if bess.get("rotated", False) else 0)
+            _, _, r_bess_cl_cfg = get_oriented_dimensions(bess_w, bess_h, bess_cl_cfg, bess_angle)
             bess_cl_poly = create_clearance_polygon(bess["footprint"], r_bess_cl_cfg)
             x, y = bess_cl_poly.exterior.xy
             ax.fill(x, y, color=col, alpha=0.10, zorder=1)
