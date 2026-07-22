@@ -24,8 +24,13 @@ def _as_polygons(geom):
     return [geom]
 
 
+def _legend_ncols(n_entries, per_col=22):
+    """Columns needed so a legend of ``n_entries`` stays a sane height."""
+    return max(1, -(-n_entries // per_col))
+
+
 def plot_layout(site, non_buildable, mvs_list, bess_list, config,
-                ax=None, title=None, figsize=None):
+                ax=None, title=None, figsize=None, restricted=()):
     bess_cl_cfg = config["equipment"]["BESS"]["clearance"]
     mvs_cl_cfg  = config["equipment"]["MVS"]["clearance"]
     bess_w, bess_h = config["equipment"]["BESS"]["width"], config["equipment"]["BESS"]["height"]
@@ -37,7 +42,11 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
 
     standalone = ax is None
     if standalone:
-        fig, ax = plt.subplots(figsize=figsize or DEFAULT_STANDALONE_FIGSIZE)
+        # constrained layout (unlike tight_layout) reserves room for the legend
+        # placed outside the axes, so it can never cover the site.
+        fig, ax = plt.subplots(
+            figsize=figsize or DEFAULT_STANDALONE_FIGSIZE, layout="constrained"
+        )
 
     if not site.is_empty:
         for poly in _as_polygons(site):
@@ -50,7 +59,21 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
             ax.fill(x, y, color="gold", alpha=0.45)
             ax.plot(x, y, color="goldenrod", linewidth=1)
 
+    # Drawn after the non-buildable zones so the hard exclusions stay readable
+    # where the two overlap.
+    for zone in restricted:
+        if not zone.is_empty:
+            for poly in _as_polygons(zone):
+                x, y = poly.exterior.xy
+                ax.fill(x, y, color="red", alpha=0.30, hatch="//", zorder=2)
+                ax.plot(x, y, color="darkred", linewidth=1.2, zorder=2)
+
     legend_handles = [mpatches.Patch(color="gold", alpha=0.45, label="Non-buildable zone")]
+    if len(restricted):
+        legend_handles.append(mpatches.Patch(
+            facecolor="red", alpha=0.30, hatch="//", edgecolor="darkred",
+            label="Restricted zone (no clearance)",
+        ))
 
     for i, (mvs, col) in enumerate(zip(mvs_list, colors)):
         r, g, b = col[:3]
@@ -108,15 +131,22 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
 
     legend_fs = 8 if standalone else 6
     title_fs  = 13 if standalone else 11
-    ax.legend(handles=legend_handles, loc="upper right", fontsize=legend_fs)
+    # Anchor the legend just outside the right edge so it never overlaps the
+    # layout; spill into extra columns once a single one would run off the top.
+    ax.legend(
+        handles=legend_handles,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.0,
+        fontsize=legend_fs,
+        ncols=_legend_ncols(len(legend_handles)),
+        framealpha=0.9,
+    )
     ax.set_aspect("equal")
     ax.set_title(title, fontsize=title_fs, fontweight="bold")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.grid(True, linestyle="--", alpha=0.3)
-
-    if standalone:
-        plt.tight_layout()
 
 
 def _scenario_title(res, config=None):
@@ -150,7 +180,11 @@ def _grid_shape(n):
 def plot_comparison(*results, config, panel_size=DEFAULT_PANEL_FIGSIZE):
     n = len(results)
     rows, cols = _grid_shape(n)
-    fig, axes = plt.subplots(rows, cols, figsize=(panel_size[0] * cols, panel_size[1] * rows))
+    fig, axes = plt.subplots(
+        rows, cols,
+        figsize=(panel_size[0] * cols, panel_size[1] * rows),
+        layout="constrained",
+    )
     if hasattr(axes, "flatten"):
         axes_flat = list(axes.flatten())
     else:
@@ -160,10 +194,10 @@ def plot_comparison(*results, config, panel_size=DEFAULT_PANEL_FIGSIZE):
             res["site"], res["non_buildable"],
             res["mvs_list"], res["bess_list"],
             config, ax=ax, title=_scenario_title(res, config),
+            restricted=res.get("restricted", ()),
         )
     for ax in axes_flat[len(results):]:
         ax.axis("off")
-    plt.tight_layout()
     plt.show()
 
 
@@ -174,6 +208,7 @@ def plot_individual(result, config, figsize=DEFAULT_STANDALONE_FIGSIZE):
         config,
         title=_scenario_title(result, config),
         figsize=figsize,
+        restricted=result.get("restricted", ()),
     )
     plt.show()
 

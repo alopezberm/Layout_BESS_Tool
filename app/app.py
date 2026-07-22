@@ -260,13 +260,14 @@ with tab_standard:
 
         editor_df = st.session_state["editor_df"]
         site_raw = create_site(CONFIG["site_vertices"])
-        site, non_buildable = prepare_site(site_raw, CONFIG)
-        mvs_list, bess_list, placement_errors = df_to_engine(editor_df, CONFIG, site, non_buildable)
+        site, non_buildable, restricted = prepare_site(site_raw, CONFIG)
+        mvs_list, bess_list, placement_errors = df_to_engine(
+            editor_df, CONFIG, site, non_buildable, restricted)
 
         with col_chart:
             for err in placement_errors:
                 st.error(err)
-            fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, CONFIG, title=f"Interactive Layout: {mode_title}")
+            fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, CONFIG, title=f"Interactive Layout: {mode_title}", restricted=restricted)
             fig.update_layout(dragmode='pan')
 
             plotly_config = {
@@ -484,6 +485,7 @@ with tab_colocated:
                 co_res["site"], co_res["non_buildable"],
                 co_res["mvs_list"], co_res["bess_list"], CO_CONFIG,
                 title="Co-Located Hub Layout",
+                restricted=co_res.get("restricted", ()),
             )
             fig.update_layout(dragmode='pan')
             plotly_config = {

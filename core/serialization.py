@@ -70,7 +70,7 @@ def engine_to_df_with_hubs(mvs_list, bess_list):
     return df
 
 
-def df_to_engine(df, config, site, non_buildable):
+def df_to_engine(df, config, site, non_buildable, restricted=()):
     """Rebuild engine objects from an (edited) DataFrame, validating each
     placement against the site and previously-placed equipment. Returns
     ``(mvs_list, bess_list, errors)``."""
@@ -100,7 +100,7 @@ def df_to_engine(df, config, site, non_buildable):
             "id": row["ID"],
         }
 
-        if not is_valid_placement(fp, cl_poly, site, non_buildable, placed):
+        if not is_valid_placement(fp, cl_poly, site, non_buildable, placed, restricted):
             errors.append(f"Collision Detected: MVS {row['ID']} overlaps with obstacles/equipment or goes out of bounds.")
 
         mvs_list.append(mvs_obj)
@@ -129,7 +129,7 @@ def df_to_engine(df, config, site, non_buildable):
         if assigned_mvs:
             assigned_mvs["assigned_bess"].append(bess_obj)
 
-        if not is_valid_placement(fp, cl_poly, site, non_buildable, placed):
+        if not is_valid_placement(fp, cl_poly, site, non_buildable, placed, restricted):
             errors.append(f"Collision Detected: BESS {row['ID']} overlaps with obstacles/equipment or goes out of bounds.")
 
         bess_list.append(bess_obj)

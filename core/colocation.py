@@ -93,7 +93,7 @@ def _determine_hub_count(buildable_area, bess_eq, max_ratio, group_size,
 
 
 def _snap_hub_to_pad(center, group_size, pad_gap, site, non_buildable, placed,
-                     mvs_eq, search_radius, grid_res):
+                     mvs_eq, search_radius, grid_res, restricted=()):
     """Feasibility repair: take a continuous (possibly infeasible) hub centre
     and find the nearest discrete, valid placement of a SHARED PAD holding
     ``group_size`` MVS laid side-by-side. Members are validated only against
@@ -123,7 +123,8 @@ def _snap_hub_to_pad(center, group_size, pad_gap, site, non_buildable, placed,
                 mx = ax + g * (rw + pad_gap)
                 fp = create_equipment_polygon(mx, ay, rw, rh)
                 cl = create_clearance_polygon(fp, rcl)
-                if not is_valid_placement(fp, cl, site, non_buildable, placed):
+                if not is_valid_placement(fp, cl, site, non_buildable, placed,
+                                          restricted):
                     ok = False
                     break
                 members.append({
@@ -139,7 +140,7 @@ def _snap_hub_to_pad(center, group_size, pad_gap, site, non_buildable, placed,
     return None
 
 
-def place_clustered_hubs(site, non_buildable, grid, config):
+def place_clustered_hubs(site, non_buildable, grid, config, restricted=()):
     """Stage-1 of the co-located pipeline: locate optimal hub positions inside
     the (possibly irregular/concave) buildable zone, then snap each to a valid
     shared pad. Returns (mvs_list, placed, avail) ready for the unmodified BESS
@@ -180,7 +181,7 @@ def place_clustered_hubs(site, non_buildable, grid, config):
     for center in centers:
         members = _snap_hub_to_pad(center, group_size, pad_gap, site,
                                    non_buildable, placed, mvs_eq,
-                                   search_radius, grid_res)
+                                   search_radius, grid_res, restricted)
         if members is None:
             continue
         hub_n += 1

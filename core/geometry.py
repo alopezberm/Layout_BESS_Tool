@@ -6,25 +6,66 @@ Pure geometry — depends only on numpy + shapely.
 
 import numpy as np
 from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
+from shapely.validation import explain_validity
 
 
 def create_site(vertices):
-    site = Polygon(vertices)
-    if not site.is_valid:
-        raise ValueError("Invalid polygon: check vertex order")
+    """Build the site geometry from one polygon or several disjoint zones.
+
+    Accepts either a bare ring ``[(x, y), ...]`` or a list of such rings
+    ``[[(x, y), ...], [(x, y), ...]]`` — multi-zone sites (e.g. a plot split by a
+    road) are unioned into a single MultiPolygon, which every downstream consumer
+    (bounds, ``contains``, plotting) already handles.
+    """
+    rings = _as_ring_list(vertices)
+    polys = []
+    for i, ring in enumerate(rings):
+        poly = Polygon(ring)
+        if not poly.is_valid:
+            raise ValueError(
+                f"Invalid site polygon #{i + 1}: {explain_validity(poly)}. "
+                "Check the vertex order — vertices must trace the boundary "
+                "without the edges crossing each other."
+            )
+        polys.append(poly)
+
+    site = polys[0] if len(polys) == 1 else unary_union(polys)
+    if site.is_empty or site.area <= 0:
+        raise ValueError("Site polygon has zero area")
     return site
 
 
+def _as_ring_list(vertices):
+    """Normalise site input to a list of rings (each a list of (x, y))."""
+    if not vertices:
+        raise ValueError("site_vertices is empty")
+    first = vertices[0]
+    # A bare ring looks like [(x, y), ...]; detect the leading (x, y) pair.
+    if (
+        isinstance(first, (tuple, list))
+        and len(first) == 2
+        and all(isinstance(c, (int, float)) for c in first)
+    ):
+        return [list(vertices)]
+    return [list(v) for v in vertices]
+
+
 def prepare_site(site, config):
-    """Apply the inward setback, subtract restricted zones, and return the
-    usable buildable polygon together with the list of non-buildable polygons.
+    """Apply the inward setback and subtract the restricted zones.
+
+    Returns ``(usable_site, non_buildable_polys, restricted_polys)``. The
+    restricted polygons are returned as well as subtracted because they are a
+    *hard* exclusion: ``is_valid_placement`` additionally forbids the clearance
+    envelope from reaching into them, which subtracting from the site alone
+    cannot express (that only constrains the footprint).
     """
+    restricted_polys = [Polygon(z) for z in config["zones"]["restricted"]]
     usable_site = site.buffer(-config["setback"])
-    for zone in config["zones"]["restricted"]:
-        zone_poly = Polygon(zone)
+    for zone_poly in restricted_polys:
         usable_site = usable_site.difference(zone_poly)
     non_buildable_polys = [Polygon(z) for z in config["zones"]["non_buildable"]]
-    return usable_site, non_buildable_polys
+    return usable_site, non_buildable_polys, restricted_polys
 
 
 def create_candidate_grid(site, resolution):
@@ -57,11 +98,23 @@ def create_clearance_polygon(footprint, clearance):
     )
 
 
-def is_valid_placement(candidate_fp, candidate_cl, site, non_buildable, placed):
+# Overlap smaller than this (m^2) is treated as flush contact, not an incursion,
+# so a clearance sitting exactly on a restricted boundary is still allowed.
+MIN_OVERLAP_AREA = 1e-9
+
+
+def is_valid_placement(candidate_fp, candidate_cl, site, non_buildable, placed,
+                       restricted=()):
     if not site.contains(candidate_fp):
         return False
     for zone in non_buildable:
         if candidate_fp.intersects(zone):
+            return False
+    # Restricted zones are hard exclusions: the clearance envelope may not
+    # encroach either, only touch the boundary.
+    for zone in restricted:
+        if candidate_cl.intersects(zone) and \
+                candidate_cl.intersection(zone).area > MIN_OVERLAP_AREA:
             return False
     for obj in placed:
         if candidate_fp.intersects(obj["clearance_zone"]):

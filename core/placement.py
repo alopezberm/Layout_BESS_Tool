@@ -36,7 +36,8 @@ def _prune_avail(avail, blocker_fp, blocker_cl, bess_eq):
 
 
 def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
-                  max_ratio, max_cable, alignment_weight, require_adjacency):
+                  max_ratio, max_cable, alignment_weight, require_adjacency,
+                  restricted=()):
     bess_cl_dict = bess_eq["clearance"]
     w, h = bess_eq["width"], bess_eq["height"]
     mx_c, my_c = mvs_obj["footprint"].centroid.x, mvs_obj["footprint"].centroid.y
@@ -50,7 +51,8 @@ def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
                 rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
                 b_fp = create_equipment_polygon(gx, gy, rw, rh)
                 b_cl = create_clearance_polygon(b_fp, rcl)
-                if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
+                if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed,
+                                          restricted):
                     continue
                 bx, by = b_fp.centroid.x, b_fp.centroid.y
                 d_mvs = np.hypot(bx - mx_c, by - my_c)
@@ -103,7 +105,7 @@ def _grow_cluster(mvs_obj, avail, site, non_buildable, placed, bess_eq,
 
 
 def _stragglers_pass(avail, site, non_buildable, placed, mvs_list, bess_list,
-                     bess_eq, max_ratio, max_cable):
+                     bess_eq, max_ratio, max_cable, restricted=()):
     bess_cl_dict = bess_eq["clearance"]
     w, h = bess_eq["width"], bess_eq["height"]
     unlimited = max_cable <= 0
@@ -114,7 +116,8 @@ def _stragglers_pass(avail, site, non_buildable, placed, mvs_list, bess_list,
                 rw, rh, rcl = get_oriented_dimensions(w, h, bess_cl_dict, angle)
                 b_fp = create_equipment_polygon(gx, gy, rw, rh)
                 b_cl = create_clearance_polygon(b_fp, rcl)
-                if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed):
+                if not is_valid_placement(b_fp, b_cl, site, non_buildable, placed,
+                                          restricted):
                     continue
                 bx, by = b_fp.centroid.x, b_fp.centroid.y
                 best_mvs = None

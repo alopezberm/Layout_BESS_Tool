@@ -26,7 +26,7 @@ def run_colocated_optimization(config, verbose=False):
     the BESS packing, then hub-balanced cable assignment. The BESS packing in
     between is the unmodified baseline machinery."""
     site_raw = create_site(config["site_vertices"])
-    site, non_buildable = prepare_site(site_raw, config)
+    site, non_buildable, restricted = prepare_site(site_raw, config)
     grid = create_candidate_grid(site, config["grid_resolution"])
 
     bess_eq = config["equipment"]["BESS"]
@@ -37,7 +37,8 @@ def run_colocated_optimization(config, verbose=False):
     balance_tol = int(co.get("balance_tolerance", 1))
 
     # Stage 1 — hub facility-location + shared-pad snapping (BEFORE BESS exist)
-    mvs_list, placed, avail = place_clustered_hubs(site, non_buildable, grid, config)
+    mvs_list, placed, avail = place_clustered_hubs(site, non_buildable, grid, config,
+                                                   restricted)
 
     # Stage 2 — baseline BESS packing around the seeded hubs
     bess_list = []
@@ -46,13 +47,14 @@ def run_colocated_optimization(config, verbose=False):
             mvs, avail, site, non_buildable, placed, bess_eq,
             max_ratio, eff_cable,
             _CO_PROFILE["alignment_weight"], _CO_PROFILE["require_adjacency"],
+            restricted,
         )
         bess_list.extend(added)
 
     if _CO_PROFILE["do_stragglers"] and mvs_list:
         avail = _stragglers_pass(
             avail, site, non_buildable, placed, mvs_list, bess_list,
-            bess_eq, max_ratio, eff_cable,
+            bess_eq, max_ratio, eff_cable, restricted,
         )
 
     # Stage 3 — hub-balanced Hungarian cable assignment
@@ -78,6 +80,7 @@ def run_colocated_optimization(config, verbose=False):
         "mode":          "colocated",
         "site":          site,
         "non_buildable": non_buildable,
+        "restricted":    restricted,
         "mvs_list":      mvs_list,
         "bess_list":     bess_list,
         "metrics":       metrics,

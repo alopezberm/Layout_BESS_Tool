@@ -13,7 +13,8 @@ def _as_polygons(geom):
     return [geom]
 
 
-def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=None):
+def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=None,
+                       restricted=()):
     fig = go.Figure()
 
     if not site.is_empty:
@@ -25,6 +26,12 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
         if not zone.is_empty:
             x, y = zone.exterior.xy
             fig.add_trace(go.Scatter(x=list(x), y=list(y), fill='toself', fillcolor='rgba(255, 215, 0, 0.45)', line=dict(color='goldenrod', width=1), name="Non-buildable", hoverinfo='skip'))
+
+    for zone in restricted:
+        if not zone.is_empty:
+            for poly in _as_polygons(zone):
+                x, y = poly.exterior.xy
+                fig.add_trace(go.Scatter(x=list(x), y=list(y), fill='toself', fillcolor='rgba(220, 20, 20, 0.30)', line=dict(color='darkred', width=1.5), name="Restricted", hoverinfo='skip'))
 
     for i, mvs in enumerate(mvs_list):
         mvs_id = mvs.get("id", f"M{i+1}")
@@ -92,12 +99,14 @@ def plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config, title=N
     return fig
 
 
-def plot_layout_plotly_hubs(site, non_buildable, mvs_list, bess_list, config, title=None):
+def plot_layout_plotly_hubs(site, non_buildable, mvs_list, bess_list, config, title=None,
+                            restricted=()):
     """Co-located variant of plot_layout_plotly. Renders the standard interactive
     layout, then overlays a dashed outline + label around each shared foundation
     pad (hub) so the clustering is visually explicit."""
     fig = plot_layout_plotly(site, non_buildable, mvs_list, bess_list, config,
-                             title=title or "Co-Located / Paired MVS Layout")
+                             title=title or "Co-Located / Paired MVS Layout",
+                             restricted=restricted)
 
     hubs = {}
     for m in mvs_list:

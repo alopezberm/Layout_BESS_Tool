@@ -64,7 +64,8 @@ def _shelf_sequence(mvs_every):
             yield item
 
 
-def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every):
+def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every,
+          restricted=()):
     """Pack one orientation. ``transpose=False`` stacks shelves along y (BESS
     long-axis horizontal); ``True`` stacks along x. ``mvs_every`` BESS rows per
     MVS row. Returns (mvs_list, bess_list).
@@ -139,7 +140,7 @@ def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every)
             while t + a_ext <= across_max and (t - across) <= search_cap:
                 fp = make(t, stack, rw, rh)
                 cl = create_clearance_polygon(fp, rcl)
-                if is_valid_placement(fp, cl, site, non_buildable, placed):
+                if is_valid_placement(fp, cl, site, non_buildable, placed, restricted):
                     placed_here = (fp, cl, t)
                     break
                 t += SEARCH_STEP
@@ -182,7 +183,7 @@ def run_row_packing(config, verbose=False):
     field) and surfaces any BESS that could not be assigned.
     """
     site_raw = create_site(config["site_vertices"])
-    site, non_buildable = prepare_site(site_raw, config)
+    site, non_buildable, restricted = prepare_site(site_raw, config)
 
     bess_eq = config["equipment"]["BESS"]
     mvs_eq = config["equipment"]["MVS"]
@@ -196,7 +197,8 @@ def run_row_packing(config, verbose=False):
     best = None
     for transpose in (False, True):
         for mvs_every in mvs_every_options:
-            mvs_l, bess_l = _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every)
+            mvs_l, bess_l = _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio,
+                                  transpose, mvs_every, restricted)
             if mvs_l and bess_l:
                 mvs_l, bess_l, dr = _optimal_reassign(
                     mvs_l, bess_l, max_cable if max_cable else 0, max_ratio)
@@ -225,6 +227,7 @@ def run_row_packing(config, verbose=False):
         "mode": "row_pack",
         "site": site,
         "non_buildable": non_buildable,
+        "restricted": restricted,
         "mvs_list": mvs_list,
         "bess_list": bess_list,
         "metrics": metrics,
