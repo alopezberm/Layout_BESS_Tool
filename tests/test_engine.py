@@ -20,6 +20,9 @@ from core import (
     build_config,
     run_colocated_optimization,
     run_row_packing,
+    run_target_packing,
+    save_site,
+    load_site,
     size_system,
 )
 from core.config import DEFAULT_EQUIPMENT
@@ -103,6 +106,43 @@ def test_row_packing_backtoback():
     assert res["metrics"]["max_cable_used"] <= config["max_cable_length"] + 1e-6
 
 
+def test_target_packing_exact_and_shortfall():
+    # 100 MWh / 5 MWh = 20 BESS: each ratio must place exactly 20 BESS on the
+    # minimum number of MVS, all valid.
+    config = make_config()
+    out = run_target_packing(config, 100, ratios=[4, 3, 2])
+    for ratio, res in out.items():
+        t = res["target"]
+        assert t["met"] and t["target_bess"] == 20
+        assert res["metrics"]["bess_count"] == 20
+        assert res["metrics"]["mvs_count"] == -(-20 // ratio)
+        _assert_no_overlaps(res)
+        _assert_capacity(res, ratio)
+        _assert_inside_site(res)
+        assert res["metrics"]["max_cable_used"] <= config["max_cable_length"] + 1e-6
+
+    # An unreachable target falls back to the maximum layout and flags it.
+    res = run_target_packing(config, 10_000, ratios=[4])[4]
+    t = res["target"]
+    assert not t["met"] and t["shortfall_mwh"] > 0
+    assert res["metrics"]["bess_count"] == t["max_bess"]
+
+
+def test_site_file_roundtrip(tmp_path=None):
+    # Geometry saved to JSON must reload into an identical config.
+    import tempfile
+    config = make_config()
+    geo = dict(site_vertices=config["site_vertices"],
+               non_buildable=config["zones"]["non_buildable"],
+               restricted=config["zones"]["restricted"])
+    with tempfile.TemporaryDirectory() as d:
+        path = save_site(os.path.join(d, "sites", "s.json"), **geo)
+        loaded = load_site(path)
+    again = build_config(**loaded)
+    assert again["zones"] == build_config(**geo)["zones"]
+    assert [tuple(map(float, p)) for p in config["site_vertices"]] == loaded["site_vertices"][0]
+
+
 def test_sizing_duration_class():
     # 4 BESS x 5 MWh = 20 MWh; 1 MVS x 2.5 MW = 2.5 MW -> 8h, nearest class 4H.
     s = size_system(4, 1, 5.0, 2.5)
@@ -129,6 +169,8 @@ if __name__ == "__main__":
     test_row_packing_invariants()
     test_colocated_invariants()
     test_row_packing_backtoback()
+    test_target_packing_exact_and_shortfall()
+    test_site_file_roundtrip()
     test_sizing_duration_class()
     test_default_equipment_contract()
     test_empty_site_does_not_crash()

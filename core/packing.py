@@ -175,6 +175,183 @@ def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every,
     return mvs_list, bess_list
 
 
+def _mvs_every_options(ratios):
+    """MVS-row densities to sweep: the BESS:MVS ratios themselves plus a few
+    neighbours (denser/sparser station rows)."""
+    return sorted(set(ratios) | {2, 3, 5, 6}, reverse=True)
+
+
+def _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq, mvs_every_options):
+    """Run ``_pack`` for both global orientations and every MVS-row density.
+
+    Packing is independent of the BESS:MVS ratio (only the assignment uses it),
+    so these raw layouts can be shared across ratio scenarios. Returns a list of
+    ``(transpose, mvs_every, mvs_list, bess_list)``.
+    """
+    out = []
+    for transpose in (False, True):
+        for mvs_every in mvs_every_options:
+            mvs_l, bess_l = _pack(site, non_buildable, bess_eq, mvs_eq, None,
+                                  transpose, mvs_every, restricted)
+            out.append((transpose, mvs_every, mvs_l, bess_l))
+    return out
+
+
+def _clone(mvs_list, bess_list):
+    """Fresh equipment dicts (geometry shared — shapely objects are immutable),
+    with assignments cleared. Lets one raw packing feed several scenarios
+    without their assignments overwriting each other."""
+    return ([{**m, "assigned_bess": []} for m in mvs_list],
+            [{**b, "mvs": None} for b in bess_list])
+
+
+def _best_max_fill(packings, max_ratio, max_cable):
+    """The original Row-Pack objective: the packing that serves the most BESS.
+    Returns ``(served, mvs_list, bess_list, transpose, mvs_every, dropped)``."""
+    best = None
+    for transpose, mvs_every, mvs_raw, bess_raw in packings:
+        mvs_l, bess_l = _clone(mvs_raw, bess_raw)
+        if mvs_l and bess_l:
+            mvs_l, bess_l, dr = _optimal_reassign(
+                mvs_l, bess_l, max_cable if max_cable else 0, max_ratio)
+        else:
+            dr = 0
+        served = len(bess_l)
+        if best is None or served > best[0]:
+            best = (served, mvs_l, bess_l, transpose, mvs_every, dr)
+    return best
+
+
+def _centroids(objs):
+    return np.array([[o["footprint"].centroid.x, o["footprint"].centroid.y]
+                     for o in objs]).reshape(-1, 2)
+
+
+def _mst_length(pts):
+    """Length of the Euclidean minimum spanning tree over ``pts`` (Prim) — a
+    proxy for the MV collection cable daisy-chaining the selected stations."""
+    n = len(pts)
+    if n < 2:
+        return 0.0
+    in_tree = np.zeros(n, bool)
+    in_tree[0] = True
+    dist = np.hypot(*(pts - pts[0]).T)
+    total = 0.0
+    for _ in range(n - 1):
+        d = np.where(in_tree, np.inf, dist)
+        j = int(np.argmin(d))
+        total += d[j]
+        in_tree[j] = True
+        dist = np.minimum(dist, np.hypot(*(pts - pts[j]).T))
+    return float(total)
+
+
+def _target_subset(mvs_raw, bess_raw, n_target, max_ratio, max_cable):
+    """Pick exactly ``n_target`` BESS and the minimum number of MVS
+    (``ceil(n_target / max_ratio)``) out of one raw packing, minimising
+    LV cable (BESS->MVS) + MV cable (MST between the chosen MVS) — i.e. the
+    shortest-cabled, most compact block. Returns
+    ``(score, mvs_idx, [(bess_idx, mvs_idx), ...])`` or None.
+
+    Candidate MVS groups are (a) contiguous windows in shelf-sweep order — the
+    plant fills the site from one side, leaving the rest free — and (b) the
+    k nearest stations around each MVS. For each group, a min-cost assignment
+    with ``n_b - n_target`` zero-cost "not built" columns chooses which BESS
+    to keep, so the dropped containers are always the farthest ones.
+    """
+    from .colocation import _solve_lap
+
+    k = -(-n_target // max_ratio)
+    n_m, n_b = len(mvs_raw), len(bess_raw)
+    if n_m < k or n_b < n_target:
+        return None
+
+    mp, bp = _centroids(mvs_raw), _centroids(bess_raw)
+    D = np.hypot(bp[:, None, 0] - mp[None, :, 0], bp[:, None, 1] - mp[None, :, 1])
+    feasible = D <= max_cable if max_cable and max_cable > 0 else np.ones_like(D, bool)
+
+    groups = {tuple(range(i, i + k)) for i in range(n_m - k + 1)}
+    MD = np.hypot(mp[:, None, 0] - mp[None, :, 0], mp[:, None, 1] - mp[None, :, 1])
+    for i in range(n_m):
+        groups.add(tuple(sorted(np.argsort(MD[i], kind="stable")[:k].tolist())))
+
+    INF = 1e9
+    best = None
+    for g in groups:
+        g = list(g)
+        rows = np.flatnonzero(feasible[:, g].any(axis=1))
+        if len(rows) < n_target:
+            continue
+        sub = np.where(feasible[np.ix_(rows, g)], D[np.ix_(rows, g)], INF)
+        slots = np.repeat(sub, max_ratio, axis=1)               # k * ratio slots
+        skip = np.zeros((len(rows), len(rows) - n_target))      # "not built"
+        cost = np.hstack([slots, skip])
+        r_ind, c_ind = _solve_lap(cost, INF)
+        n_slots = slots.shape[1]
+        pairs, total = [], 0.0
+        for r, c in zip(r_ind, c_ind):
+            if c < n_slots and cost[r, c] < INF:
+                pairs.append((int(rows[r]), g[c // max_ratio]))
+                total += cost[r, c]
+        if len(pairs) != n_target:
+            continue
+        total += _mst_length(mp[g])
+        if best is None or total < best[0] - 1e-6:
+            best = (total, g, pairs)
+    return best
+
+
+def _build_from_subset(mvs_raw, bess_raw, pairs):
+    """Materialise a chosen subset as fresh MVS/BESS dicts with assignments."""
+    mvs_l, bess_l = _clone(mvs_raw, bess_raw)
+    used_m = sorted({j for _, j in pairs})
+    remap = {j: mvs_l[j] for j in used_m}
+    out_b = []
+    for i, j in sorted(pairs):
+        b, m = bess_l[i], remap[j]
+        b["mvs"] = m
+        m["assigned_bess"].append(b)
+        out_b.append(b)
+    return [remap[j] for j in used_m], out_b
+
+
+def _result(site, non_buildable, restricted, mvs_list, bess_list, max_ratio,
+            dropped, label=None, target=None):
+    metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, max_ratio)
+    metrics["dropped_bess"] = dropped
+    res = {
+        "mode": "row_pack",
+        "site": site,
+        "non_buildable": non_buildable,
+        "restricted": restricted,
+        "mvs_list": mvs_list,
+        "bess_list": bess_list,
+        "metrics": metrics,
+    }
+    if label:
+        res["label"] = label
+    if target is not None:
+        res["target"] = target
+    return res
+
+
+def _print_summary(res, header):
+    m = res["metrics"]
+    print(f"\n----- {header} -----")
+    print(f"MVS units placed   : {m['mvs_count']}")
+    print(f"BESS units placed  : {m['bess_count']}")
+    print(f"Fully sat. MVS     : {m['full_mvs']} / {m['mvs_count']}")
+    print(f"Total cable        : {m['total_cable']:.1f} m")
+    print(f"Capacity saturation: {m['capacity_saturation_pct']:.1f}%")
+    if m.get("dropped_bess"):
+        print(f"NOTE: {m['dropped_bess']} extra BESS packed beyond total MVS capacity (unassigned).")
+    t = res.get("target")
+    if t:
+        status = "MET" if t["met"] else f"NOT MET — max {t['achieved_mwh']:.1f} MWh fits"
+        print(f"Target             : {t['target_mwh']:.1f} MWh "
+              f"({t['target_bess']} BESS) -> {status}")
+
+
 def run_row_packing(config, verbose=False):
     """Top-level entry point for the row/shelf packing engine.
 
@@ -193,42 +370,86 @@ def run_row_packing(config, verbose=False):
 
     # Sweep both global orientations and a few MVS densities; keep the layout
     # that serves the most BESS after cable-cap assignment.
-    mvs_every_options = sorted({max_ratio, 2, 3, 5, 6}, reverse=True)
-    best = None
-    for transpose in (False, True):
-        for mvs_every in mvs_every_options:
-            mvs_l, bess_l = _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio,
-                                  transpose, mvs_every, restricted)
-            if mvs_l and bess_l:
-                mvs_l, bess_l, dr = _optimal_reassign(
-                    mvs_l, bess_l, max_cable if max_cable else 0, max_ratio)
-            else:
-                dr = 0
-            served = len(bess_l)
-            if best is None or served > best[0]:
-                best = (served, mvs_l, bess_l, transpose, mvs_every, dr)
+    packings = _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq,
+                         _mvs_every_options([max_ratio]))
+    _, mvs_list, bess_list, transpose, mvs_every, dropped = _best_max_fill(
+        packings, max_ratio, max_cable)
 
-    _, mvs_list, bess_list, transpose, mvs_every, dropped = best
-
-    metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, max_ratio)
-    metrics["dropped_bess"] = dropped
-
+    res = _result(site, non_buildable, restricted, mvs_list, bess_list,
+                  max_ratio, dropped)
     if verbose:
-        print(f"\n----- ROW PACK ({'vertical' if transpose else 'horizontal'} rows, MVS every {mvs_every}) -----")
-        print(f"MVS units placed   : {metrics['mvs_count']}")
-        print(f"BESS units placed  : {metrics['bess_count']}")
-        print(f"Fully sat. MVS     : {metrics['full_mvs']} / {metrics['mvs_count']}")
-        print(f"Total cable        : {metrics['total_cable']:.1f} m")
-        print(f"Capacity saturation: {metrics['capacity_saturation_pct']:.1f}%")
-        if dropped:
-            print(f"NOTE: {dropped} extra BESS packed beyond total MVS capacity (unassigned).")
+        _print_summary(res, f"ROW PACK ({'vertical' if transpose else 'horizontal'} rows, MVS every {mvs_every})")
+    return res
 
-    return {
-        "mode": "row_pack",
-        "site": site,
-        "non_buildable": non_buildable,
-        "restricted": restricted,
-        "mvs_list": mvs_list,
-        "bess_list": bess_list,
-        "metrics": metrics,
-    }
+
+def run_target_packing(config, target_mwh, ratios=None, verbose=False):
+    """Row Pack sized to an energy target, for one or more BESS:MVS ratios.
+
+    For each ratio in ``ratios`` (default: ``config["max_bess_per_mvs"]``) it
+    places exactly ``ceil(target_mwh / bess_unit_mwh)`` BESS with the minimum
+    number of MVS (``ceil(n_bess / ratio)``), choosing — across every packing
+    of the site — the group that minimises total cable. If the target does not
+    fit, it falls back to the maximum-fill layout for that ratio and flags the
+    shortfall.
+
+    Returns ``{ratio: result}``; each result is the usual Row-Pack dict plus
+    ``label`` and ``target`` = {target_mwh, target_bess, achieved_bess,
+    achieved_mwh, met, shortfall_mwh, max_bess, max_mwh}.
+    """
+    site_raw = create_site(config["site_vertices"])
+    site, non_buildable, restricted = prepare_site(site_raw, config)
+
+    bess_eq = config["equipment"]["BESS"]
+    mvs_eq = config["equipment"]["MVS"]
+    max_cable = config.get("max_cable_length", 25)
+    unit_mwh = config["bess_unit_mwh"]
+    if unit_mwh <= 0:
+        raise ValueError("bess_unit_mwh must be > 0 to size to an energy target")
+    if ratios is None:
+        ratios = [config["max_bess_per_mvs"]]
+    ratios = [int(r) for r in ratios]
+    n_target = int(np.ceil(target_mwh / unit_mwh - 1e-9))
+
+    # One packing sweep shared by every ratio.
+    packings = _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq,
+                         _mvs_every_options(ratios))
+
+    results = {}
+    for ratio in ratios:
+        max_fill = _best_max_fill(packings, ratio, max_cable)
+        max_bess = max_fill[0]
+
+        best = None
+        if 0 < n_target <= max_bess:
+            for transpose, mvs_every, mvs_raw, bess_raw in packings:
+                sel = _target_subset(mvs_raw, bess_raw, n_target, ratio, max_cable)
+                if sel and (best is None or sel[0] < best[0] - 1e-6):
+                    best = (sel[0], mvs_raw, bess_raw, sel[2], transpose, mvs_every)
+
+        if best is not None:
+            _, mvs_raw, bess_raw, pairs, transpose, mvs_every = best
+            mvs_list, bess_list = _build_from_subset(mvs_raw, bess_raw, pairs)
+            dropped = 0
+        else:
+            _, mvs_list, bess_list, transpose, mvs_every, dropped = max_fill
+
+        achieved = len(bess_list)
+        target = {
+            "target_mwh": float(target_mwh),
+            "target_bess": n_target,
+            "achieved_bess": achieved,
+            "achieved_mwh": achieved * unit_mwh,
+            "met": achieved >= n_target,
+            "shortfall_mwh": max(0.0, (n_target - achieved) * unit_mwh),
+            "max_bess": max_bess,
+            "max_mwh": max_bess * unit_mwh,
+            "ratio": ratio,
+        }
+        res = _result(site, non_buildable, restricted, mvs_list, bess_list,
+                      ratio, dropped, label=f"{ratio} BESS/MVS", target=target)
+        results[ratio] = res
+        if verbose:
+            _print_summary(res, f"TARGET {target_mwh:g} MWh @ {ratio} BESS/MVS "
+                                f"({'vertical' if transpose else 'horizontal'} rows, "
+                                f"MVS every {mvs_every})")
+    return results

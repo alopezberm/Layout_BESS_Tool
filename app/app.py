@@ -19,7 +19,7 @@ import pandas as pd
 from core import (
     build_config,
     run_colocated_optimization,
-    run_row_packing,
+    run_target_packing,
     compute_metrics,
     create_site,
     prepare_site,
@@ -105,7 +105,8 @@ with st.sidebar:
     m_right = st.slider("MVS Right", 0.0, 5.0, 1.5, 0.25)
 
     st.subheader("Capacity")
-    max_bess = st.slider("Max BESS per MVS", 1, 8, 4, 1)
+    max_bess = st.slider("Max BESS per MVS", 1, 8, 4, 1,
+                         help="Co-Located tab. The Standard tab compares the BESS-per-MVS scenarios chosen in Target Sizing.")
 
     st.subheader("Commercial Equipment Scaling")
     bess_cap = st.slider("BESS Unit Capacity (MWh)", 0.0, 15.0, 5.0, 0.5)
@@ -150,9 +151,29 @@ with tab_standard:
             non_buildable_input = st.text_area("Non-Buildable Zones", value=DEFAULT_NONBUILD_ZONE, help="Areas reserved for access roads, environmental restrictions, or buffer corridors where no hardware can be placed.")
             restricted_input = st.text_area("Restricted / Out of Scope Zones", value=DEFAULT_RESTRICT_ZONE, help="Additional zones completely excluded from evaluation.")
 
+        with st.expander("🎯 Target Sizing", expanded=True):
+            st.markdown(
+                "Size the plant to an energy target with the BESS unit capacity from the sidebar. "
+                "Each BESS-per-MVS scenario places exactly the BESS needed with the fewest MVS, as a "
+                "compact block with minimum cable; if the target does not fit, it shows the maximum "
+                "that does."
+            )
+            tcol1, tcol2 = st.columns(2)
+            target_mwh = tcol1.number_input(
+                "Target Energy (MWh) — 0 = fill the site", min_value=0.0,
+                value=float(st.session_state.get("target_mwh", 0.0)), step=10.0)
+            ratios = tcol2.multiselect(
+                "BESS per MVS scenarios", options=list(range(1, 9)),
+                default=st.session_state.get("ratios", [4, 3, 2]))
+            if target_mwh > 0 and bess_cap > 0:
+                st.caption(f"{target_mwh:g} MWh ÷ {bess_cap:g} MWh/BESS → "
+                           f"**{-(-target_mwh // bess_cap):.0f} BESS**")
+
         st.session_state["site_input"] = site_input
         st.session_state["non_buildable_input"] = non_buildable_input
         st.session_state["restricted_input"] = restricted_input
+        st.session_state["target_mwh"] = target_mwh
+        st.session_state["ratios"] = sorted(ratios, reverse=True) or [max_bess]
 
         st.markdown("---")
         _, center_col, _ = st.columns([1, 2, 1])
@@ -186,43 +207,48 @@ with tab_standard:
             st.session_state["phase"] = 1
             st.rerun()
 
-        state_str = f"{st.session_state['site_input']}|{st.session_state['non_buildable_input']}|{st.session_state['restricted_input']}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{max_bess}"
+        target_mwh = st.session_state.get("target_mwh", 0.0)
+        ratios = st.session_state.get("ratios", [max_bess])
+
+        state_str = f"{st.session_state['site_input']}|{st.session_state['non_buildable_input']}|{st.session_state['restricted_input']}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{bess_cap}|{target_mwh}|{ratios}"
         cache_key = get_hash(state_str)
-        modes = ["row_pack"]
+        modes = [f"ratio_{r}" for r in ratios]
 
         if cache_key not in st.session_state["benchmark_results"]:
             st.session_state["benchmark_results"][cache_key] = {}
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
             try:
-                for i, mode in enumerate(modes):
-                    status_text.text("Calculating Row Pack layout (back-to-back)...")
-                    res = run_row_packing(CONFIG, verbose=False)
-                    st.session_state["benchmark_results"][cache_key][mode] = {
+                goal = f"{target_mwh:g} MWh target" if target_mwh > 0 else "maximum fill"
+                with st.spinner(f"Calculating Row Pack layouts ({goal}, {', '.join(map(str, ratios))} BESS/MVS)..."):
+                    out = run_target_packing(CONFIG, target_mwh, ratios=ratios)
+                for r, res in out.items():
+                    st.session_state["benchmark_results"][cache_key][f"ratio_{r}"] = {
                         "df": engine_to_df(res["mvs_list"], res["bess_list"]),
                         "metrics": res["metrics"],
+                        "target": res["target"],
+                        "ratio": r,
                     }
-                    progress_bar.progress((i + 1) / len(modes))
             except Exception as e:
                 del st.session_state["benchmark_results"][cache_key]
-                status_text.empty()
-                progress_bar.empty()
                 st.error(f"Optimization failed (check the site geometry): {e}")
                 st.stop()
-
-            status_text.empty()
-            progress_bar.empty()
 
         results = st.session_state["benchmark_results"][cache_key]
         cols = st.columns(len(modes))
 
         for i, mode in enumerate(modes):
             with cols[i]:
-                st.markdown(f"### {mode.replace('_', ' ').title()}")
+                st.markdown(f"### {results[mode]['ratio']} BESS / MVS")
                 metrics = results[mode]["metrics"]
+                tgt = results[mode]["target"]
                 sizing = size_system(metrics["bess_count"], metrics["mvs_count"], bess_cap, mvs_pow)
+
+                if target_mwh > 0:
+                    if tgt["met"]:
+                        st.success(f"✅ {target_mwh:g} MWh fits ({tgt['target_bess']} BESS)")
+                    else:
+                        st.warning(f"⚠️ Only {tgt['max_mwh']:.1f} MWh fits — "
+                                   f"{tgt['shortfall_mwh']:.1f} MWh short. Showing max layout.")
 
                 st.metric("Total BESS", metrics["bess_count"])
                 st.metric("Total MVS", metrics["mvs_count"])
@@ -235,8 +261,9 @@ with tab_standard:
                 if metrics.get("dropped_bess"):
                     st.warning(f"{metrics['dropped_bess']} BESS unassigned (cable cap).")
 
-                if st.button(f"🔎 Select {mode.replace('_', ' ').title()}", key=f"select_{mode}", use_container_width=True):
+                if st.button(f"🔎 Select {results[mode]['ratio']} BESS/MVS", key=f"select_{mode}", use_container_width=True):
                     st.session_state["active_mode"] = mode
+                    st.session_state["active_ratio"] = results[mode]["ratio"]
                     st.session_state["editor_df"] = results[mode]["df"].copy()
                     st.session_state["phase"] = 3
                     st.session_state["selected_id"] = None
@@ -246,7 +273,8 @@ with tab_standard:
     # PHASE 3: DEEP-DIVE & QUICK ADJUSTMENTS
     # ---------------------------------------------------------
     if st.session_state["phase"] == 3:
-        mode_title = st.session_state["active_mode"].replace('_', ' ').title()
+        active_ratio = st.session_state.get("active_ratio", max_bess)
+        mode_title = f"Row Pack — {active_ratio} BESS/MVS"
 
         col_back, col_title = st.columns([1, 10])
         with col_back:
@@ -272,7 +300,7 @@ with tab_standard:
 
             plotly_config = {
                 'scrollZoom': True,
-                'toImageButtonOptions': {'format': 'png', 'filename': f'bess_layout_{mode_title}', 'height': 1080, 'width': 1920}
+                'toImageButtonOptions': {'format': 'png', 'filename': f'bess_layout_{st.session_state["active_mode"]}', 'height': 1080, 'width': 1920}
             }
 
             event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points", config=plotly_config)
@@ -284,7 +312,7 @@ with tab_standard:
                     st.rerun()
 
         with col_data:
-            metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, CONFIG["max_bess_per_mvs"])
+            metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, active_ratio)
             sizing = size_system(metrics["bess_count"], metrics["mvs_count"], bess_cap, mvs_pow)
 
             kpi_col1, kpi_col2, kpi_col3 = st.columns(3)

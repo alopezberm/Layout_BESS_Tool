@@ -152,7 +152,8 @@ def plot_layout(site, non_buildable, mvs_list, bess_list, config,
 def _scenario_title(res, config=None):
     m = res["metrics"]
     title = (
-        f"{res['mode'].replace('_', ' ').upper()} — "
+        f"{res['mode'].replace('_', ' ').upper()}"
+        f"{' (' + res['label'] + ')' if res.get('label') else ''} — "
         f"{m['mvs_count']} MVS | {m['bess_count']} BESS | "
         f"Cable {m['total_cable']:.0f} m | "
         f"Area sat {m['area_saturation_pct']:.1f}%"

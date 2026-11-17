@@ -30,7 +30,7 @@ def print_comparison(config, *results):
         "row_pack":  "Row Pack",
         "colocated": "Co-Located",
     }
-    headers = ["Metric"] + [pretty.get(r["mode"], r["mode"]) for r in results]
+    headers = ["Metric"] + [r.get("label") or pretty.get(r["mode"], r["mode"]) for r in results]
     col_w = 20
     sep = "─" * (col_w * len(headers))
 
