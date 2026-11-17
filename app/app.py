@@ -596,6 +596,10 @@ with tab_target:
         target_mwh = tc1.number_input("Target Energy (MWh)", min_value=1.0, value=200.0, step=10.0)
         durations = tc2.multiselect("System Duration (h)", options=[1, 2, 3, 4, 6, 8], default=[4],
                                     help="Pick one or several to compare.")
+        allow_cross = st.checkbox(
+            "Allow BESS cables across non-buildable land as a last resort", value=True,
+            help="Each BESS is first kept on an MVS in its own buildable zone. If checked, cables "
+                 "may cross non-buildable land only when that is the only way to fit more BESS.")
         if bess_cap > 0 and mvs_pow > 0:
             n_b = -(-target_mwh // bess_cap)
             for h in sorted(durations, reverse=True):
@@ -616,7 +620,8 @@ with tab_target:
         try:
             with st.spinner("Sizing the plant for each duration..."):
                 st.session_state["target_results"] = run_target_packing(
-                    TG_CONFIG, target_mwh, durations=sorted(durations, reverse=True))
+                    TG_CONFIG, target_mwh, durations=sorted(durations, reverse=True),
+                    allow_cross_zone=allow_cross)
             st.session_state["target_config"] = TG_CONFIG
         except Exception as e:
             st.error(f"Target sizing failed (check the site geometry): {e}")
@@ -636,6 +641,8 @@ with tab_target:
                 else:
                     st.warning(f"⚠️ Max {t['achieved_mwh']:.1f} MWh fits at {h}H — "
                                f"{t['shortfall_mwh']:.1f} MWh short")
+                if t["cross_zone_cables"]:
+                    st.warning(f"🔌 {t['cross_zone_cables']} BESS cable(s) cross non-buildable land")
                 st.metric("BESS / MVS", f"{t['achieved_bess']} / {t['achieved_mvs']}")
                 st.metric("Plant Energy", f"{t['achieved_mwh']:.1f} MWh")
                 st.metric("Plant Power", f"{t['achieved_mw']:.1f} MW")

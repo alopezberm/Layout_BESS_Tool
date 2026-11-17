@@ -20,7 +20,11 @@ every individual unit is still validated with the shared ``is_valid_placement``
 non-buildable zones; the analytic positions are merely candidates.
 """
 
+import itertools
+
 import numpy as np
+from shapely.geometry import Point
+from shapely.ops import unary_union
 
 from .geometry import (
     create_site,
@@ -41,7 +45,7 @@ EPS = 1e-3
 SEARCH_STEP = 0.1
 
 
-def _shelf_sequence(mvs_every):
+def _shelf_sequence(mvs_every, start=0):
     """Yield (kind, base_phase) for an unbounded run of shelves.
 
     Each band holds `mvs_every` BESS shelves (alternating phase for
@@ -49,6 +53,10 @@ def _shelf_sequence(mvs_every):
     farthest BESS row is only ~`mvs_every/2` rows from its station — keeping
     cable runs short. Smaller `mvs_every` -> more stations (denser BESS can be
     served at the cost of BESS area).
+
+    ``start`` rotates the band so the sweep begins at a different shelf of the
+    cycle — shifting where the MVS rows land relative to the site edge, which
+    can leave each station centred among its BESS on irregular boundaries.
     """
     mid = mvs_every // 2
     band = []
@@ -59,13 +67,14 @@ def _shelf_sequence(mvs_every):
         else:
             band.append(("BESS", phase % 2))
             phase += 1
+    band = band[start % len(band):] + band[:start % len(band)]
     while True:
         for item in band:
             yield item
 
 
 def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every,
-          restricted=()):
+          restricted=(), start=0):
     """Pack one orientation. ``transpose=False`` stacks shelves along y (BESS
     long-axis horizontal); ``True`` stacks along x. ``mvs_every`` BESS rows per
     MVS row. Returns (mvs_list, bess_list).
@@ -102,7 +111,7 @@ def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every,
         return create_equipment_polygon(x, y, rw, rh)
 
     placed, bess_list, mvs_list = [], [], []
-    seq = _shelf_sequence(mvs_every)
+    seq = _shelf_sequence(mvs_every, start)
 
     stack = stack_min + EPS
     prev_top_cl = None        # clearance on the top side of the previous shelf
@@ -154,7 +163,9 @@ def _pack(site, non_buildable, bess_eq, mvs_eq, max_ratio, transpose, mvs_every,
                 bess_list.append(obj)
             else:
                 obj = {"type": "MVS", "footprint": fp, "clearance_zone": cl,
-                       "assigned_bess": [], "angle": angle, "rotated": angle in (90, 270)}
+                       "assigned_bess": [], "angle": angle, "rotated": angle in (90, 270),
+                       # axis along which this MVS's shelves stack (0 = x, 1 = y)
+                       "stack_axis": 0 if transpose else 1}
                 mvs_list.append(obj)
             placed.append(obj)
             shelf_objs.append(obj)
@@ -181,19 +192,106 @@ def _mvs_every_options(ratios):
     return sorted(set(ratios) | {2, 3, 5, 6}, reverse=True)
 
 
-def _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq, mvs_every_options):
-    """Run ``_pack`` for both global orientations and every MVS-row density.
-
-    Packing is independent of the BESS:MVS ratio (only the assignment uses it),
-    so these raw layouts can be shared across ratio scenarios. Returns a list of
-    ``(transpose, mvs_every, mvs_list, bess_list)``.
-    """
+def _pack_variants(area, non_buildable, restricted, bess_eq, mvs_eq,
+                   mvs_every_options, shift_for):
+    """``_pack`` over ``area`` for both orientations, every MVS-row density and,
+    for the densities in ``shift_for``, every rotation of the shelf band."""
     out = []
     for transpose in (False, True):
         for mvs_every in mvs_every_options:
-            mvs_l, bess_l = _pack(site, non_buildable, bess_eq, mvs_eq, None,
-                                  transpose, mvs_every, restricted)
-            out.append((transpose, mvs_every, mvs_l, bess_l))
+            starts = range(mvs_every + 1) if mvs_every in shift_for else (0,)
+            for start in starts:
+                mvs_l, bess_l = _pack(area, non_buildable, bess_eq, mvs_eq, None,
+                                      transpose, mvs_every, restricted, start)
+                out.append((transpose, mvs_every, mvs_l, bess_l))
+    return out
+
+
+# Best per-zone packings combined into whole-site candidates (per zone).
+ZONE_TOP_K = 4
+
+
+def _per_zone_packings(site, non_buildable, restricted, bess_eq, mvs_eq,
+                       mvs_every_options, shift_for, zones, max_ratio, max_cable,
+                       global_packings=()):
+    """Whole-site candidates built by packing every buildable zone on its own.
+
+    A global packing shares one shelf grid across the site, so on a site split
+    into separate zones the MVS rows can only be centred in one of them. Here
+    each zone gets its own orientation / density / MVS-row offset — or the part
+    of a global packing that falls inside it, when that fits more; per zone the
+    ``ZONE_TOP_K`` packings serving the most BESS (ties: best layout score —
+    compact, centred, convex cable) are kept and every combination is merged
+    (re-validated against the other zones' units) into one candidate.
+    """
+    min_area = bess_eq["width"] * bess_eq["height"]
+    useful = [z for z in zones if z.area >= min_area]
+    if len(useful) < 2:
+        return []
+
+    # Each global packing split by zone, so a zone may also keep the global grid.
+    split = [(t, e, _zone_index(m, useful), _zone_index(b, useful), m, b)
+             for t, e, m, b in global_packings]
+
+    ranked = []
+    for zi, zone in enumerate(useful):
+        # Per zone only the ratio densities (every offset) — the ones that can
+        # centre the stations; other densities still come in via the global split.
+        cands = _pack_variants(zone, non_buildable, restricted, bess_eq, mvs_eq,
+                               sorted(shift_for) or mvs_every_options, shift_for)
+        cands += [(t, e, [o for o, z in zip(m, zm) if z == zi],
+                   [o for o, z in zip(b, zb) if z == zi])
+                  for t, e, zm, zb, m, b in split]
+        cands = [c for c in cands if c[2] and c[3]]
+        if not cands:
+            continue
+        served = []
+        _best_max_fill(cands, max_ratio, max_cable, served)
+        # Only candidates that can make the top-K by BESS count need a layout score.
+        cutoff = sorted(served, reverse=True)[min(ZONE_TOP_K, len(served)) - 1]
+        scored = []
+        for cand, n in zip(cands, served):
+            if n == 0 or n < cutoff:
+                continue
+            sel = _target_subset(cand[2], cand[3], n, -(-n // max_ratio), max_cable)
+            scored.append((-n, sel[0] if sel else np.inf, len(scored), cand))
+        scored.sort(key=lambda x: x[:3])
+        if scored:
+            ranked.append([c for *_, c in scored[:ZONE_TOP_K]])
+    if len(ranked) < 2:
+        return []
+
+    out = []
+    for combo in itertools.product(*ranked):
+        placed, mvs_all, bess_all = [], [], []
+        for _, _, mvs_l, bess_l in combo:
+            for obj in mvs_l + bess_l:
+                if is_valid_placement(obj["footprint"], obj["clearance_zone"], site,
+                                      non_buildable, placed, restricted):
+                    placed.append(obj)
+                    (mvs_all if obj["type"] == "MVS" else bess_all).append(obj)
+        out.append((None, "per-zone", mvs_all, bess_all))
+    return out
+
+
+def _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq, mvs_every_options,
+              shift_for=(), zones=None, max_ratio=None, max_cable=None):
+    """Run ``_pack`` for both global orientations and every MVS-row density.
+
+    Packing is independent of the BESS:MVS ratio (only the assignment uses it),
+    so these raw layouts can be shared across ratio scenarios. For the densities
+    in ``shift_for`` every rotation of the shelf band is also tried (see
+    ``_shelf_sequence``). With several buildable ``zones``, per-zone packings
+    (see ``_per_zone_packings``) are added as further candidates. Returns a
+    list of ``(transpose, mvs_every, mvs_list, bess_list)``; per-zone
+    candidates carry ``transpose=None``.
+    """
+    out = _pack_variants(site, non_buildable, restricted, bess_eq, mvs_eq,
+                         mvs_every_options, shift_for)
+    if zones and max_ratio:
+        out += _per_zone_packings(site, non_buildable, restricted, bess_eq, mvs_eq,
+                                  mvs_every_options, shift_for, zones, max_ratio,
+                                  max_cable, global_packings=out)
     return out
 
 
@@ -205,9 +303,10 @@ def _clone(mvs_list, bess_list):
             [{**b, "mvs": None} for b in bess_list])
 
 
-def _best_max_fill(packings, max_ratio, max_cable):
+def _best_max_fill(packings, max_ratio, max_cable, served_out=None):
     """The original Row-Pack objective: the packing that serves the most BESS.
-    Returns ``(served, mvs_list, bess_list, transpose, mvs_every, dropped)``."""
+    Returns ``(served, mvs_list, bess_list, transpose, mvs_every, dropped)``;
+    if ``served_out`` is a list, the BESS served by each packing is appended."""
     best = None
     for transpose, mvs_every, mvs_raw, bess_raw in packings:
         mvs_l, bess_l = _clone(mvs_raw, bess_raw)
@@ -215,8 +314,11 @@ def _best_max_fill(packings, max_ratio, max_cable):
             mvs_l, bess_l, dr = _optimal_reassign(
                 mvs_l, bess_l, max_cable if max_cable else 0, max_ratio)
         else:
-            dr = 0
+            # No station placed (or no BESS): nothing is served.
+            mvs_l, bess_l, dr = [], [], len(bess_l)
         served = len(bess_l)
+        if served_out is not None:
+            served_out.append(served)
         if best is None or served > best[0]:
             best = (served, mvs_l, bess_l, transpose, mvs_every, dr)
     return best
@@ -246,20 +348,163 @@ def _mst_length(pts):
     return float(total)
 
 
-def _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable):
+def _buildable_zones(site, non_buildable):
+    """Connected buildable areas: the site minus the non-buildable zones, split
+    into its separate polygons. A cable between two of them would have to cross
+    non-buildable land."""
+    area = site.difference(unary_union(non_buildable)) if non_buildable else site
+    return list(getattr(area, "geoms", [area]))
+
+
+def _zone_index(objs, zones):
+    """Index of the buildable zone holding each object's footprint centroid."""
+    out = np.zeros(len(objs), int)
+    for i, o in enumerate(objs):
+        c = o["footprint"].centroid
+        out[i] = int(np.argmin([z.distance(c) for z in zones])) if len(zones) > 1 else 0
+    return out
+
+
+# Convex LV-cable cost: a BESS at ``d`` metres from its MVS costs d^2 / REF, so
+# a run of REF metres costs REF and every extra metre costs progressively more
+# (two BESS at 4 m -> 8, one at 4 m + one at 5 m -> 10.25). The optimiser thus
+# keeps every BESS close to its station instead of saving total length by
+# pushing a single unit far away. Reported cable KPIs stay in real metres.
+CABLE_REF_M = 4.0
+
+
+def _cable_cost(d):
+    return d * d / CABLE_REF_M
+
+
+# Cost added for each BESS sitting on the "wrong" side of its MVS, so the
+# station ends up in the middle of its cluster (2+2 rather than 1+3). Soft: it is
+# accepted when the geometry leaves no alternative (e.g. MVS at a row end).
+CENTER_PENALTY = 50.0
+# Cost of one LV cable crossing non-buildable land in the last-resort pass —
+# large, so the layout uses as few crossings as possible.
+CROSS_PENALTY = 1000.0
+# Offsets (m) along the stacking axis below this count as "beside" the MVS.
+SIDE_TOL = 0.5
+
+
+def _slot_sides(cap):
+    """Side of each of an MVS's ``cap`` BESS slots along the stacking axis:
+    alternating -1 / +1 so the cluster is split evenly around the station; with
+    an odd cap the last slot may sit on either side (0)."""
+    return [0 if (cap % 2 and i == cap - 1) else (-1 if i % 2 == 0 else 1)
+            for i in range(cap)]
+
+
+def _side_penalty(offset, side):
+    """CENTER_PENALTY where a BESS with stack-axis ``offset`` (BESS - MVS)
+    lies on the opposite side to the slot's ``side``; 0 otherwise."""
+    if side == 0:
+        return np.zeros_like(offset)
+    return np.where(side * offset < -SIDE_TOL, CENTER_PENALTY, 0.0)
+
+
+def _stack_offsets(bp, mvs_list):
+    """Offset of every BESS (rows of ``bp``) from every MVS along that MVS's own
+    shelf-stacking axis."""
+    mp = _centroids(mvs_list)
+    ax = np.array([m.get("stack_axis", 1) for m in mvs_list], int)
+    return bp[:, ax] - mp[np.arange(len(mvs_list)), ax][None, :]
+
+
+def _rebalance_clusters(mvs_list, bess_list, max_ratio, max_cable):
+    """Re-pair an already-served layout so each MVS sits in the middle of its
+    BESS (convex cable cost plus the side penalty). Keeps the original
+    assignment if the re-pairing would leave a BESS unserved or an MVS empty,
+    so BESS / MVS counts never change."""
+    from .colocation import _solve_lap
+
+    if not mvs_list or not bess_list:
+        return mvs_list, bess_list
+    mp, bp = _centroids(mvs_list), _centroids(bess_list)
+    D = np.hypot(bp[:, None, 0] - mp[None, :, 0], bp[:, None, 1] - mp[None, :, 1])
+    off = _stack_offsets(bp, mvs_list)
+    feasible = D <= max_cable if max_cable and max_cable > 0 else np.ones_like(D, bool)
+    INF = 1e9
+    cols, owner = [], []
+    for j in range(len(mvs_list)):
+        for side in _slot_sides(max_ratio):
+            cols.append(np.where(feasible[:, j],
+                                 _cable_cost(D[:, j]) + _side_penalty(off[:, j], side), INF))
+            owner.append(j)
+    cost = np.column_stack(cols)
+    r_ind, c_ind = _solve_lap(cost, INF)
+    used = {owner[c] for r, c in zip(r_ind, c_ind) if cost[r, c] < INF}
+    if (sum(cost[r, c] < INF for r, c in zip(r_ind, c_ind)) != len(bess_list)
+            or len(used) != len(mvs_list)):
+        return mvs_list, bess_list   # never drop a BESS or empty a station
+    for m in mvs_list:
+        m["assigned_bess"] = []
+    for r, c in zip(r_ind, c_ind):
+        m, b = mvs_list[owner[c]], bess_list[r]
+        b["mvs"] = m
+        m["assigned_bess"].append(b)
+    return [m for m in mvs_list if m["assigned_bess"]], bess_list
+
+
+def _drop_group(D, feasible, n_bess, k, cap):
+    """MVS group of size ``k`` found by greedy closing: start from every
+    station, assign ``n_bess`` BESS (convex cable cost, ``cap`` per MVS) and
+    repeatedly close the least-loaded station until ``k`` remain. Unlike
+    windows, this yields spread-out groups (e.g. every other station along a
+    long zone) when the cable cap demands it. Returns a tuple or None."""
+    from .colocation import _solve_lap
+
+    INF = 1e9
+    g = list(range(D.shape[1]))
+    while len(g) > k:
+        rows = np.flatnonzero(feasible[:, g].any(axis=1))
+        if len(rows) < n_bess:
+            return None
+        sub = np.where(feasible[np.ix_(rows, g)], _cable_cost(D[np.ix_(rows, g)]), INF)
+        cost = np.hstack([np.repeat(sub, cap, axis=1),
+                          np.zeros((len(rows), len(rows) - n_bess))])
+        r_ind, c_ind = _solve_lap(cost, INF)
+        load = np.zeros(len(g))
+        spend = np.zeros(len(g))
+        n_slots = len(g) * cap
+        for r, c in zip(r_ind, c_ind):
+            if c < n_slots and cost[r, c] < INF:
+                load[c // cap] += 1
+                spend[c // cap] += cost[r, c]
+        if load.sum() < n_bess:
+            return None
+        # Close the station serving the fewest BESS (ties: the costliest).
+        g.pop(int(np.lexsort((-spend, load))[0]))
+    return tuple(g)
+
+
+def _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable,
+                   zone_b=None, zone_m=None, soft_zones=False):
     """Pick exactly ``n_bess`` BESS on exactly ``n_mvs`` MVS out of one raw
     packing, balanced (every MVS gets ``floor`` or ``ceil`` of
-    ``n_bess / n_mvs``), minimising LV cable (BESS->MVS) + MV cable (MST
-    between the chosen MVS) — i.e. the shortest-cabled, most compact block.
+    ``n_bess / n_mvs``), minimising the convex LV cable cost (BESS->MVS, see
+    ``CABLE_REF_M``) + MV cable (MST between the chosen MVS) — i.e. the most
+    compact block with every BESS as close as possible to its station.
     Returns ``(score, mvs_idx, [(bess_idx, mvs_idx), ...])`` or None.
 
     Candidate MVS groups are (a) contiguous windows in shelf-sweep order — the
-    plant fills the site from one side, leaving the rest free — and (b) the
-    ``n_mvs`` nearest stations around each MVS. For each group a min-cost
+    plant fills the site from one side, leaving the rest free — (b) the
+    ``n_mvs`` nearest stations around each MVS and (c) a greedy-closing group
+    (``_drop_group``) that can spread stations out along a long zone. For each group a min-cost
     assignment picks the BESS: each MVS has ``floor`` mandatory slots (cost
     biased so they are always filled) plus one optional slot when the split is
     uneven, and ``n_rows - n_bess`` zero-cost "not built" columns let the
     farthest containers drop out.
+
+    Each MVS's slots are split between both sides along its own shelf-stacking
+    axis (see ``CENTER_PENALTY``) so the station ends up in the middle of its
+    cluster.
+
+    With ``zone_b`` / ``zone_m`` (buildable-zone index per BESS / MVS), a BESS
+    may only feed an MVS in its own zone — no LV cable crosses non-buildable
+    land. With ``soft_zones`` a crossing is allowed but costs
+    ``CROSS_PENALTY``, so as few as possible are used.
     """
     from .colocation import _solve_lap
 
@@ -273,11 +518,23 @@ def _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable):
     mp, bp = _centroids(mvs_raw), _centroids(bess_raw)
     D = np.hypot(bp[:, None, 0] - mp[None, :, 0], bp[:, None, 1] - mp[None, :, 1])
     feasible = D <= max_cable if max_cable and max_cable > 0 else np.ones_like(D, bool)
+    CROSS = np.zeros_like(D)
+    if zone_b is not None:
+        same = zone_b[:, None] == zone_m[None, :]
+        if soft_zones:
+            CROSS = np.where(same, 0.0, CROSS_PENALTY)
+        else:
+            feasible &= same
+    OFF = _stack_offsets(bp, mvs_raw)
+    sides = _slot_sides(cap)
 
     groups = {tuple(range(i, i + k)) for i in range(n_m - k + 1)}
     MD = np.hypot(mp[:, None, 0] - mp[None, :, 0], mp[:, None, 1] - mp[None, :, 1])
     for i in range(n_m):
         groups.add(tuple(sorted(np.argsort(MD[i], kind="stable")[:k].tolist())))
+    dg = _drop_group(D, feasible, n_bess, k, cap)
+    if dg is not None:
+        groups.add(dg)
 
     INF, BONUS = 1e9, 1e6
     best = None
@@ -288,12 +545,16 @@ def _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable):
             continue
         feas = feasible[np.ix_(rows, g)]
         dist = D[np.ix_(rows, g)]
-        cols, owner = [], []
+        off = OFF[np.ix_(rows, g)]
+        cross = CROSS[np.ix_(rows, g)]
+        cols, owner, pens = [], [], []
         for j in range(k):
             for slot in range(cap):
                 bonus = BONUS if slot < base else 0.0
-                cols.append(np.where(feas[:, j], dist[:, j] - bonus, INF))
+                pen = _side_penalty(off[:, j], sides[slot]) + cross[:, j]
+                cols.append(np.where(feas[:, j], _cable_cost(dist[:, j]) + pen - bonus, INF))
                 owner.append(j)
+                pens.append(pen)
         n_slots = len(cols)
         skip = np.zeros((len(rows), len(rows) - n_bess))        # "not built"
         cost = np.hstack([np.column_stack(cols), skip])
@@ -305,13 +566,42 @@ def _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable):
                 j = owner[c]
                 pairs.append((int(rows[r]), g[j]))
                 counts[j] += 1
-                total += dist[r, j]
+                total += _cable_cost(dist[r, j]) + pens[c][r]
         if len(pairs) != n_bess or counts.min() < base:
             continue
         total += _mst_length(mp[g])
         if best is None or total < best[0] - 1e-6:
             best = (total, g, pairs)
     return best
+
+
+def _select_layout(packings, zone_ids, n_bess, n_mvs, max_cable, allow_cross_zone):
+    """Best ``n_bess`` BESS on ``n_mvs`` MVS across all ``packings`` (see
+    ``_target_subset``). Every BESS is first kept on an MVS of its own buildable
+    zone; LV cables across non-buildable land are allowed only as a last resort
+    (and only with ``allow_cross_zone``). Returns
+    ``(score, mvs_raw, bess_raw, pairs, transpose, mvs_every)`` or None."""
+    def once(same_zone):
+        best = None
+        for (transpose, mvs_every, mvs_raw, bess_raw), (zm, zb) in zip(packings, zone_ids):
+            sel = _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable, zb, zm,
+                                 soft_zones=not same_zone)
+            if sel and (best is None or sel[0] < best[0] - 1e-6):
+                best = (sel[0], mvs_raw, bess_raw, sel[2], transpose, mvs_every)
+        return best
+
+    best = once(same_zone=True)
+    multi_zone = any(len(set(zm)) > 1 or len(set(zb)) > 1 for zm, zb in zone_ids)
+    if best is None and allow_cross_zone and multi_zone:
+        best = once(same_zone=False)
+    return best
+
+
+def _cross_zone_count(mvs_list, bess_list, zones):
+    """BESS whose LV cable crosses non-buildable land (MVS in another zone)."""
+    zb = _zone_index(bess_list, zones)
+    zm = dict(zip(map(id, mvs_list), _zone_index(mvs_list, zones)))
+    return int(sum(zm[id(b["mvs"])] != z for b, z in zip(bess_list, zb)))
 
 
 def _build_from_subset(mvs_raw, bess_raw, pairs):
@@ -348,6 +638,12 @@ def _result(site, non_buildable, restricted, mvs_list, bess_list, max_ratio,
     return res
 
 
+def _rows_label(transpose, mvs_every):
+    if transpose is None:
+        return "rows packed per buildable zone"
+    return f"{'vertical' if transpose else 'horizontal'} rows, MVS every {mvs_every}"
+
+
 def _print_summary(res, header):
     m = res["metrics"]
     print(f"\n----- {header} -----")
@@ -358,6 +654,9 @@ def _print_summary(res, header):
     print(f"Capacity saturation: {m['capacity_saturation_pct']:.1f}%")
     if m.get("dropped_bess"):
         print(f"NOTE: {m['dropped_bess']} extra BESS packed beyond total MVS capacity (unassigned).")
+    if m.get("cross_zone_cables"):
+        print(f"WARNING: {m['cross_zone_cables']} BESS cable(s) cross non-buildable land "
+              "(needed to reach the maximum).")
     t = res.get("target")
     if t:
         status = "MET" if t["met"] else f"NOT MET — max {t['achieved_mwh']:.1f} MWh fits"
@@ -365,14 +664,23 @@ def _print_summary(res, header):
               f"({t['target_bess']} BESS / {t['target_mvs']} MVS) -> {status}")
         print(f"Plant              : {t['achieved_mwh']:.1f} MWh | {t['achieved_mw']:.1f} MW | "
               f"{t['achieved_duration_h']:.2f} h | up to {t['bess_per_mvs']} BESS/MVS")
+        if t.get("cross_zone_cables"):
+            print(f"WARNING: {t['cross_zone_cables']} BESS cable(s) cross non-buildable land "
+                  "(needed to fit more BESS; allow_cross_zone=False forbids it).")
 
 
 def run_row_packing(config, verbose=False):
-    """Top-level entry point for the row/shelf packing engine.
+    """Top-level entry point for the row/shelf packing engine — maximises the
+    number of BESS.
 
-    Tries both global orientations, keeps the denser one, then assigns BESS to
-    MVS with the shared Hungarian solver (unlimited cable within the packed
-    field) and surfaces any BESS that could not be assigned.
+    1. Packs the site for both global orientations and several MVS-row
+       densities/offsets, and finds the largest number of BESS that can be
+       served (Hungarian assignment under the cable and per-MVS caps).
+    2. Lays out exactly that many BESS on the fewest MVS with the same
+       selection as the target-sizing study: convex cable cost (every BESS
+       close to its station), MVS centred in its cluster, compact block, and
+       LV cables kept inside one buildable zone unless crossing is the only
+       way to reach the maximum.
     """
     site_raw = create_site(config["site_vertices"])
     site, non_buildable, restricted = prepare_site(site_raw, config)
@@ -385,32 +693,65 @@ def run_row_packing(config, verbose=False):
 
     # Sweep both global orientations and a few MVS densities; keep the layout
     # that serves the most BESS after cable-cap assignment.
+    # The MVS-row offsets are also tried at the cap density, so the maximum is
+    # searched over the same candidates the target-sizing study uses.
+    zones = _buildable_zones(site, non_buildable)
     packings = _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq,
-                         _mvs_every_options([max_ratio]))
-    _, mvs_list, bess_list, transpose, mvs_every, dropped = _best_max_fill(
-        packings, max_ratio, max_cable)
+                         _mvs_every_options([max_ratio]), shift_for={max_ratio},
+                         zones=zones, max_ratio=max_ratio, max_cable=max_cable)
+    per_packing = []
+    served, mvs_list, bess_list, transpose, mvs_every, dropped = _best_max_fill(
+        packings, max_ratio, max_cable, per_packing)
+
+    best = None
+    if served:
+        # Only packings that can serve the maximum can host the final layout.
+        top = [pk for pk, n in zip(packings, per_packing) if n == served]
+        zone_ids = [(_zone_index(m, zones), _zone_index(b, zones)) for _, _, m, b in top]
+        best = _select_layout(top, zone_ids, served, -(-served // max_ratio),
+                              max_cable, allow_cross_zone=True)
+    if best is not None:
+        _, mvs_raw, bess_raw, pairs, transpose, mvs_every = best
+        mvs_list, bess_list = _build_from_subset(mvs_raw, bess_raw, pairs)
+        dropped = 0
+    else:
+        # Fallback: keep the max-fill assignment, re-paired so each MVS sits
+        # mid-cluster (same BESS / MVS counts).
+        mvs_list, bess_list = _rebalance_clusters(
+            mvs_list, bess_list, max_ratio, max_cable)
 
     res = _result(site, non_buildable, restricted, mvs_list, bess_list,
                   max_ratio, dropped)
+    res["metrics"]["cross_zone_cables"] = _cross_zone_count(mvs_list, bess_list, zones)
     if verbose:
-        _print_summary(res, f"ROW PACK ({'vertical' if transpose else 'horizontal'} rows, MVS every {mvs_every})")
+        _print_summary(res, f"ROW PACK ({_rows_label(transpose, mvs_every)})")
     return res
 
 
-def _mvs_needed(n_bess, unit_mwh, duration_h, mvs_mw):
-    """MVS stations needed so ``n_bess`` containers discharge in ``duration_h``."""
-    return max(1, int(np.ceil(n_bess * unit_mwh / duration_h / mvs_mw - 1e-6)))
+def _mvs_needed(n_bess, unit_mwh, duration_h, mvs_mw, max_ratio):
+    """MVS stations needed so ``n_bess`` containers discharge in ``duration_h``
+    without any MVS exceeding ``max_ratio`` BESS (the equipment's hard cap)."""
+    by_power = int(np.ceil(n_bess * unit_mwh / duration_h / mvs_mw - 1e-6))
+    by_cap = -(-n_bess // max_ratio)
+    return max(1, by_power, by_cap)
 
 
-def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
+def run_target_packing(config, target_mwh, durations=(4,), allow_cross_zone=True,
+                       verbose=False):
     """EXTRA — Row Pack sized to an energy target at a chosen system duration.
 
     For each duration (hours) in ``durations``:
       * BESS = ceil(target_mwh / bess_unit_mwh)
-      * MVS  = ceil(BESS energy / duration / mvs_station_mw)
+      * MVS  = ceil(BESS energy / duration / mvs_station_mw), and never fewer
+        than ceil(BESS / max_bess_per_mvs) — no MVS exceeds the equipment cap
     i.e. the duration fixes the plant power and hence the station count; BESS
     are split evenly across the MVS (floor/ceil). Across every packing of the
-    site it keeps the block with minimum LV + MV cable. If the target does not
+    site it keeps the block with minimum convex LV cost + MV cable (the same
+    selection ``run_row_packing`` uses for its maximum), first requiring every
+    BESS to feed an MVS in its own buildable zone (no LV cable across
+    non-buildable land) and relaxing that only if the target cannot be met
+    otherwise (``target["cross_zone_cables"]`` counts them);
+    ``allow_cross_zone=False`` never relaxes it. If the target does not
     fit, it returns the largest plant that does fit **at the same duration**
     and flags the shortfall.
 
@@ -430,6 +771,7 @@ def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
     max_cable = config.get("max_cable_length", 25)
     unit_mwh = config["bess_unit_mwh"]
     mvs_mw = config["mvs_station_mw"]
+    max_ratio = config["max_bess_per_mvs"]
     if unit_mwh <= 0 or mvs_mw <= 0:
         raise ValueError("bess_unit_mwh and mvs_station_mw must be > 0 to size to a target")
     if target_mwh <= 0:
@@ -439,18 +781,17 @@ def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
 
     # One packing sweep shared by every duration; MVS-row densities around the
     # BESS:MVS ratios these durations imply.
-    ratios = {max(1, round(h * mvs_mw / unit_mwh)) for h in durations}
+    ratios = {min(max_ratio, max(1, round(h * mvs_mw / unit_mwh))) for h in durations}
+    # Buildable zone of every packed unit, to keep LV cables inside one zone.
+    zones = _buildable_zones(site, non_buildable)
     packings = _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq,
-                         _mvs_every_options(ratios))
+                         _mvs_every_options(ratios), shift_for=ratios,
+                         zones=zones, max_ratio=max_ratio, max_cable=max_cable)
+    zone_ids = [(_zone_index(m, zones), _zone_index(b, zones)) for _, _, m, b in packings]
 
     def solve(n, h):
-        k = _mvs_needed(n, unit_mwh, h, mvs_mw)
-        best = None
-        for transpose, mvs_every, mvs_raw, bess_raw in packings:
-            sel = _target_subset(mvs_raw, bess_raw, n, k, max_cable)
-            if sel and (best is None or sel[0] < best[0] - 1e-6):
-                best = (sel[0], mvs_raw, bess_raw, sel[2], transpose, mvs_every)
-        return best
+        k = _mvs_needed(n, unit_mwh, h, mvs_mw, max_ratio)
+        return _select_layout(packings, zone_ids, n, k, max_cable, allow_cross_zone)
 
     results = {}
     for h in durations:
@@ -475,8 +816,9 @@ def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
             mvs_list, bess_list, transpose, mvs_every = [], [], False, 0
 
         n_b, n_m = len(bess_list), len(mvs_list)
+        cross = _cross_zone_count(mvs_list, bess_list, zones)
         cap = max((len(m["assigned_bess"]) for m in mvs_list), default=0)
-        target_mvs = _mvs_needed(n_target, unit_mwh, h, mvs_mw)
+        target_mvs = _mvs_needed(n_target, unit_mwh, h, mvs_mw, max_ratio)
         target = {
             "target_mwh": float(target_mwh),
             "duration_h": h,
@@ -489,6 +831,7 @@ def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
             "achieved_mw": n_m * mvs_mw,
             "achieved_duration_h": (n_b * unit_mwh / (n_m * mvs_mw)) if n_m else 0.0,
             "bess_per_mvs": cap,
+            "cross_zone_cables": cross,
             "met": n_b >= n_target,
             "shortfall_mwh": max(0.0, (n_target - n_b) * unit_mwh),
         }
@@ -497,6 +840,5 @@ def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
         results[int(h) if h.is_integer() else h] = res
         if verbose:
             _print_summary(res, f"TARGET {target_mwh:g} MWh @ {h:g}H "
-                                f"({'vertical' if transpose else 'horizontal'} rows, "
-                                f"MVS every {mvs_every})")
+                                f"({_rows_label(transpose, mvs_every)})")
     return results

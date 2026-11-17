@@ -129,6 +129,30 @@ def test_target_packing_exact_and_shortfall():
     assert t["achieved_mvs"] == -(-t["achieved_bess"] * 5.0 // (4 * 2.5))
 
 
+def test_target_packing_keeps_cables_in_zone():
+    # The default site is split by the non-buildable corridor into two zones.
+    # A target that fits must not need any LV cable across the corridor, and
+    # allow_cross_zone=False must never produce one, even at max fill.
+    config = make_config()
+    t = run_target_packing(config, 100, durations=[4])[4]["target"]
+    assert t["met"] and t["cross_zone_cables"] == 0
+    t = run_target_packing(config, 10_000, durations=[2], allow_cross_zone=False)[2]["target"]
+    assert t["cross_zone_cables"] == 0 and t["achieved_bess"] > 0
+
+
+def test_target_never_beats_max_and_respects_cap():
+    # Target sizing is a restriction of the max-fill problem: it can never place
+    # more BESS than run_row_packing, and no MVS may exceed max_bess_per_mvs
+    # (even when the power split would suggest one more BESS per station).
+    config = make_config(bess_unit_mwh=7.144, mvs_station_mw=7.4)
+    max_bess = run_row_packing(config)["metrics"]["bess_count"]
+    out = run_target_packing(config, 10_000, durations=[4, 2])
+    for res in out.values():
+        assert res["target"]["achieved_bess"] <= max_bess
+        _assert_capacity(res, config["max_bess_per_mvs"])
+    assert out[4]["target"]["achieved_bess"] == max_bess
+
+
 def test_site_file_roundtrip(tmp_path=None):
     # Geometry saved to JSON must reload into an identical config.
     import tempfile
@@ -171,6 +195,8 @@ if __name__ == "__main__":
     test_colocated_invariants()
     test_row_packing_backtoback()
     test_target_packing_exact_and_shortfall()
+    test_target_packing_keeps_cables_in_zone()
+    test_target_never_beats_max_and_respects_cap()
     test_site_file_roundtrip()
     test_sizing_duration_class()
     test_default_equipment_contract()
