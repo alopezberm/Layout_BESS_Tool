@@ -246,25 +246,29 @@ def _mst_length(pts):
     return float(total)
 
 
-def _target_subset(mvs_raw, bess_raw, n_target, max_ratio, max_cable):
-    """Pick exactly ``n_target`` BESS and the minimum number of MVS
-    (``ceil(n_target / max_ratio)``) out of one raw packing, minimising
-    LV cable (BESS->MVS) + MV cable (MST between the chosen MVS) — i.e. the
-    shortest-cabled, most compact block. Returns
-    ``(score, mvs_idx, [(bess_idx, mvs_idx), ...])`` or None.
+def _target_subset(mvs_raw, bess_raw, n_bess, n_mvs, max_cable):
+    """Pick exactly ``n_bess`` BESS on exactly ``n_mvs`` MVS out of one raw
+    packing, balanced (every MVS gets ``floor`` or ``ceil`` of
+    ``n_bess / n_mvs``), minimising LV cable (BESS->MVS) + MV cable (MST
+    between the chosen MVS) — i.e. the shortest-cabled, most compact block.
+    Returns ``(score, mvs_idx, [(bess_idx, mvs_idx), ...])`` or None.
 
     Candidate MVS groups are (a) contiguous windows in shelf-sweep order — the
     plant fills the site from one side, leaving the rest free — and (b) the
-    k nearest stations around each MVS. For each group, a min-cost assignment
-    with ``n_b - n_target`` zero-cost "not built" columns chooses which BESS
-    to keep, so the dropped containers are always the farthest ones.
+    ``n_mvs`` nearest stations around each MVS. For each group a min-cost
+    assignment picks the BESS: each MVS has ``floor`` mandatory slots (cost
+    biased so they are always filled) plus one optional slot when the split is
+    uneven, and ``n_rows - n_bess`` zero-cost "not built" columns let the
+    farthest containers drop out.
     """
     from .colocation import _solve_lap
 
-    k = -(-n_target // max_ratio)
+    k = n_mvs
     n_m, n_b = len(mvs_raw), len(bess_raw)
-    if n_m < k or n_b < n_target:
+    if k < 1 or n_m < k or n_b < n_bess:
         return None
+    base, extra = divmod(n_bess, k)
+    cap = base + (1 if extra else 0)
 
     mp, bp = _centroids(mvs_raw), _centroids(bess_raw)
     D = np.hypot(bp[:, None, 0] - mp[None, :, 0], bp[:, None, 1] - mp[None, :, 1])
@@ -275,25 +279,34 @@ def _target_subset(mvs_raw, bess_raw, n_target, max_ratio, max_cable):
     for i in range(n_m):
         groups.add(tuple(sorted(np.argsort(MD[i], kind="stable")[:k].tolist())))
 
-    INF = 1e9
+    INF, BONUS = 1e9, 1e6
     best = None
     for g in groups:
         g = list(g)
         rows = np.flatnonzero(feasible[:, g].any(axis=1))
-        if len(rows) < n_target:
+        if len(rows) < n_bess:
             continue
-        sub = np.where(feasible[np.ix_(rows, g)], D[np.ix_(rows, g)], INF)
-        slots = np.repeat(sub, max_ratio, axis=1)               # k * ratio slots
-        skip = np.zeros((len(rows), len(rows) - n_target))      # "not built"
-        cost = np.hstack([slots, skip])
+        feas = feasible[np.ix_(rows, g)]
+        dist = D[np.ix_(rows, g)]
+        cols, owner = [], []
+        for j in range(k):
+            for slot in range(cap):
+                bonus = BONUS if slot < base else 0.0
+                cols.append(np.where(feas[:, j], dist[:, j] - bonus, INF))
+                owner.append(j)
+        n_slots = len(cols)
+        skip = np.zeros((len(rows), len(rows) - n_bess))        # "not built"
+        cost = np.hstack([np.column_stack(cols), skip])
         r_ind, c_ind = _solve_lap(cost, INF)
-        n_slots = slots.shape[1]
         pairs, total = [], 0.0
+        counts = np.zeros(k, int)
         for r, c in zip(r_ind, c_ind):
             if c < n_slots and cost[r, c] < INF:
-                pairs.append((int(rows[r]), g[c // max_ratio]))
-                total += cost[r, c]
-        if len(pairs) != n_target:
+                j = owner[c]
+                pairs.append((int(rows[r]), g[j]))
+                counts[j] += 1
+                total += dist[r, j]
+        if len(pairs) != n_bess or counts.min() < base:
             continue
         total += _mst_length(mp[g])
         if best is None or total < best[0] - 1e-6:
@@ -348,8 +361,10 @@ def _print_summary(res, header):
     t = res.get("target")
     if t:
         status = "MET" if t["met"] else f"NOT MET — max {t['achieved_mwh']:.1f} MWh fits"
-        print(f"Target             : {t['target_mwh']:.1f} MWh "
-              f"({t['target_bess']} BESS) -> {status}")
+        print(f"Target             : {t['target_mwh']:.1f} MWh @ {t['duration_h']:g}H "
+              f"({t['target_bess']} BESS / {t['target_mvs']} MVS) -> {status}")
+        print(f"Plant              : {t['achieved_mwh']:.1f} MWh | {t['achieved_mw']:.1f} MW | "
+              f"{t['achieved_duration_h']:.2f} h | up to {t['bess_per_mvs']} BESS/MVS")
 
 
 def run_row_packing(config, verbose=False):
@@ -382,19 +397,30 @@ def run_row_packing(config, verbose=False):
     return res
 
 
-def run_target_packing(config, target_mwh, ratios=None, verbose=False):
-    """Row Pack sized to an energy target, for one or more BESS:MVS ratios.
+def _mvs_needed(n_bess, unit_mwh, duration_h, mvs_mw):
+    """MVS stations needed so ``n_bess`` containers discharge in ``duration_h``."""
+    return max(1, int(np.ceil(n_bess * unit_mwh / duration_h / mvs_mw - 1e-6)))
 
-    For each ratio in ``ratios`` (default: ``config["max_bess_per_mvs"]``) it
-    places exactly ``ceil(target_mwh / bess_unit_mwh)`` BESS with the minimum
-    number of MVS (``ceil(n_bess / ratio)``), choosing — across every packing
-    of the site — the group that minimises total cable. If the target does not
-    fit, it falls back to the maximum-fill layout for that ratio and flags the
-    shortfall.
 
-    Returns ``{ratio: result}``; each result is the usual Row-Pack dict plus
-    ``label`` and ``target`` = {target_mwh, target_bess, achieved_bess,
-    achieved_mwh, met, shortfall_mwh, max_bess, max_mwh}.
+def run_target_packing(config, target_mwh, durations=(4,), verbose=False):
+    """EXTRA — Row Pack sized to an energy target at a chosen system duration.
+
+    For each duration (hours) in ``durations``:
+      * BESS = ceil(target_mwh / bess_unit_mwh)
+      * MVS  = ceil(BESS energy / duration / mvs_station_mw)
+    i.e. the duration fixes the plant power and hence the station count; BESS
+    are split evenly across the MVS (floor/ceil). Across every packing of the
+    site it keeps the block with minimum LV + MV cable. If the target does not
+    fit, it returns the largest plant that does fit **at the same duration**
+    and flags the shortfall.
+
+    The primary objective of the tool is still ``run_row_packing`` (maximum
+    number of BESS); this is an optional sizing study on top of it.
+
+    Returns ``{duration_h: result}``; each result is the usual Row-Pack dict
+    plus ``label`` and ``target`` = {target_mwh, duration_h, target_bess,
+    target_mvs, target_mw, achieved_bess, achieved_mvs, achieved_mwh,
+    achieved_mw, achieved_duration_h, bess_per_mvs, met, shortfall_mwh}.
     """
     site_raw = create_site(config["site_vertices"])
     site, non_buildable, restricted = prepare_site(site_raw, config)
@@ -403,53 +429,74 @@ def run_target_packing(config, target_mwh, ratios=None, verbose=False):
     mvs_eq = config["equipment"]["MVS"]
     max_cable = config.get("max_cable_length", 25)
     unit_mwh = config["bess_unit_mwh"]
-    if unit_mwh <= 0:
-        raise ValueError("bess_unit_mwh must be > 0 to size to an energy target")
-    if ratios is None:
-        ratios = [config["max_bess_per_mvs"]]
-    ratios = [int(r) for r in ratios]
+    mvs_mw = config["mvs_station_mw"]
+    if unit_mwh <= 0 or mvs_mw <= 0:
+        raise ValueError("bess_unit_mwh and mvs_station_mw must be > 0 to size to a target")
+    if target_mwh <= 0:
+        raise ValueError("target_mwh must be > 0 (use run_row_packing to maximise)")
+    durations = [float(h) for h in durations]
     n_target = int(np.ceil(target_mwh / unit_mwh - 1e-9))
 
-    # One packing sweep shared by every ratio.
+    # One packing sweep shared by every duration; MVS-row densities around the
+    # BESS:MVS ratios these durations imply.
+    ratios = {max(1, round(h * mvs_mw / unit_mwh)) for h in durations}
     packings = _pack_all(site, non_buildable, restricted, bess_eq, mvs_eq,
                          _mvs_every_options(ratios))
 
-    results = {}
-    for ratio in ratios:
-        max_fill = _best_max_fill(packings, ratio, max_cable)
-        max_bess = max_fill[0]
-
+    def solve(n, h):
+        k = _mvs_needed(n, unit_mwh, h, mvs_mw)
         best = None
-        if 0 < n_target <= max_bess:
-            for transpose, mvs_every, mvs_raw, bess_raw in packings:
-                sel = _target_subset(mvs_raw, bess_raw, n_target, ratio, max_cable)
-                if sel and (best is None or sel[0] < best[0] - 1e-6):
-                    best = (sel[0], mvs_raw, bess_raw, sel[2], transpose, mvs_every)
+        for transpose, mvs_every, mvs_raw, bess_raw in packings:
+            sel = _target_subset(mvs_raw, bess_raw, n, k, max_cable)
+            if sel and (best is None or sel[0] < best[0] - 1e-6):
+                best = (sel[0], mvs_raw, bess_raw, sel[2], transpose, mvs_every)
+        return best
+
+    results = {}
+    for h in durations:
+        best = solve(n_target, h)
+        if best is None:
+            # Largest plant that still fits at this duration (binary search).
+            lo, hi = 0, n_target - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                sol = solve(mid, h)
+                if sol is not None:
+                    lo, best = mid, sol
+                else:
+                    hi = mid - 1
+            if lo > 0 and (best is None or len(best[3]) != lo):
+                best = solve(lo, h)
 
         if best is not None:
             _, mvs_raw, bess_raw, pairs, transpose, mvs_every = best
             mvs_list, bess_list = _build_from_subset(mvs_raw, bess_raw, pairs)
-            dropped = 0
         else:
-            _, mvs_list, bess_list, transpose, mvs_every, dropped = max_fill
+            mvs_list, bess_list, transpose, mvs_every = [], [], False, 0
 
-        achieved = len(bess_list)
+        n_b, n_m = len(bess_list), len(mvs_list)
+        cap = max((len(m["assigned_bess"]) for m in mvs_list), default=0)
+        target_mvs = _mvs_needed(n_target, unit_mwh, h, mvs_mw)
         target = {
             "target_mwh": float(target_mwh),
+            "duration_h": h,
             "target_bess": n_target,
-            "achieved_bess": achieved,
-            "achieved_mwh": achieved * unit_mwh,
-            "met": achieved >= n_target,
-            "shortfall_mwh": max(0.0, (n_target - achieved) * unit_mwh),
-            "max_bess": max_bess,
-            "max_mwh": max_bess * unit_mwh,
-            "ratio": ratio,
+            "target_mvs": target_mvs,
+            "target_mw": target_mvs * mvs_mw,
+            "achieved_bess": n_b,
+            "achieved_mvs": n_m,
+            "achieved_mwh": n_b * unit_mwh,
+            "achieved_mw": n_m * mvs_mw,
+            "achieved_duration_h": (n_b * unit_mwh / (n_m * mvs_mw)) if n_m else 0.0,
+            "bess_per_mvs": cap,
+            "met": n_b >= n_target,
+            "shortfall_mwh": max(0.0, (n_target - n_b) * unit_mwh),
         }
         res = _result(site, non_buildable, restricted, mvs_list, bess_list,
-                      ratio, dropped, label=f"{ratio} BESS/MVS", target=target)
-        results[ratio] = res
+                      max(cap, 1), 0, label=f"{h:g}H", target=target)
+        results[int(h) if h.is_integer() else h] = res
         if verbose:
-            _print_summary(res, f"TARGET {target_mwh:g} MWh @ {ratio} BESS/MVS "
+            _print_summary(res, f"TARGET {target_mwh:g} MWh @ {h:g}H "
                                 f"({'vertical' if transpose else 'horizontal'} rows, "
                                 f"MVS every {mvs_every})")
     return results

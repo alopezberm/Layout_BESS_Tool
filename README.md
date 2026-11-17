@@ -55,7 +55,7 @@ tests/        invariant tests
 | Engine | What it does |
 | :--- | :--- |
 | **Row Pack** ([`core/packing.py`](core/packing.py), `run_row_packing`) | Primary optimizer. Analytic back-to-back shelf packing adaptive to arbitrary concave polygons, evaluating all 4 rotations, with interleaved MVS rows and cable-cap-aware Hungarian assignment. Runs in ~1-3 s. |
-| **Target Sizing** ([`core/packing.py`](core/packing.py), `run_target_packing`) | Sizes the plant to an energy target (MWh) for one or more BESS-per-MVS ratios (e.g. 4 / 3 / 2). Places exactly `ceil(target / bess_unit_mwh)` BESS on the fewest MVS, choosing across every Row-Pack packing the block that minimises LV cable (BESS→MVS) + MV cable (MST between MVS). If the target does not fit, returns the maximum layout and reports the shortfall. |
+| **Target Sizing** *(extra)* ([`core/packing.py`](core/packing.py), `run_target_packing`) | Optional study on top of the main (max-BESS) design. Sizes the plant to an energy target (MWh) at one or more chosen system durations (h): BESS = ⌈MWh / `bess_unit_mwh`⌉, MVS = ⌈MW / `mvs_station_mw`⌉ with MW = MWh / duration, BESS split evenly across MVS. Keeps the block with minimum LV cable (BESS→MVS) + MV cable (MST between MVS). If the target does not fit, returns the largest plant that fits at the same duration and reports the shortfall. |
 | **Co-Located** ([`core/optimize.py`](core/optimize.py), `run_colocated_optimization`) | Optional scenario that seeds MVS onto shared foundation pads (paired / hub) via facility-location before packing BESS, then balances cable across each hub. |
 
 ## Installation
@@ -97,16 +97,16 @@ print(size_system(m["bess_count"], m["mvs_count"],
                   CONFIG["bess_unit_mwh"], CONFIG["mvs_station_mw"]))
 ```
 
-Size to an energy target and compare BESS-per-MVS ratios (one packing sweep
-is shared by every ratio):
+Extra — size to an energy target at a chosen system duration (the main
+objective stays `run_row_packing`, maximum BESS):
 
 ```python
 from core import run_target_packing
 
-out = run_target_packing(CONFIG, target_mwh=200, ratios=[4, 3, 2], verbose=True)
-for ratio, res in out.items():
-    t = res["target"]   # target_bess, achieved_mwh, met, shortfall_mwh, max_mwh
-    print(ratio, t["achieved_bess"], t["met"], t["shortfall_mwh"])
+out = run_target_packing(CONFIG, target_mwh=200, durations=[4, 3, 2], verbose=True)
+for h, res in out.items():
+    t = res["target"]   # achieved_bess/_mvs/_mwh/_mw, achieved_duration_h, met, shortfall_mwh
+    print(f"{h}H", t["achieved_bess"], t["achieved_mvs"], t["met"], t["shortfall_mwh"])
 ```
 
 Keep a site's hand-traced vertices in their own file so they are never lost
@@ -137,9 +137,11 @@ streamlit run app/app.py
 
 The app exposes a three-phase workflow:
 
-1. **Site definition** — paste the property boundary, non-buildable corridors and restricted zones as vertex lists; tune BESS / MVS clearances and commercial MWh / MW scaling factors. In **Target Sizing**, set an energy target (0 = fill the site) and the BESS-per-MVS scenarios to compare (default 4 / 3 / 2).
-2. **Row-Pack optimization** — one column per BESS-per-MVS scenario, flagging whether the target fits (or the maximum MWh that does); each reports BESS / MVS count, plant energy, plant power, storage duration, total cable length, and area saturation.
+1. **Site definition** — paste the property boundary, non-buildable corridors and restricted zones as vertex lists; tune BESS / MVS clearances, max BESS per MVS, and commercial MWh / MW scaling factors.
+2. **Row-Pack optimization** — the back-to-back packing engine maximises the number of BESS and reports BESS / MVS count, plant energy, plant power, storage duration, total cable length, and area saturation.
 3. **Deep-dive editor** — click a unit on the interactive Plotly canvas (or pick from the dropdown) to nudge its X/Y coordinates, change orientation (0/90/180/270), reassign its MVS network, or delete it. Collisions are validated live. Layouts can be exported as a 1920×1080 PNG and the bill of quantities as a CSV report.
+
+An extra **🎯 Target Sizing** tab (last tab) sizes the plant to an energy target at the chosen system duration(s), one column per duration, with layout preview and CSV export.
 
 Benchmark results are cached per input hash, so re-entering Phase 2 with unchanged parameters is instantaneous.
 

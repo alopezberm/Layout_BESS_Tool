@@ -19,6 +19,7 @@ import pandas as pd
 from core import (
     build_config,
     run_colocated_optimization,
+    run_row_packing,
     run_target_packing,
     compute_metrics,
     create_site,
@@ -58,6 +59,8 @@ for key, default in [
     ("active_mode", None),
     ("colocated_results", None),
     ("colocated_config", None),
+    ("target_results", None),
+    ("target_config", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -105,8 +108,7 @@ with st.sidebar:
     m_right = st.slider("MVS Right", 0.0, 5.0, 1.5, 0.25)
 
     st.subheader("Capacity")
-    max_bess = st.slider("Max BESS per MVS", 1, 8, 4, 1,
-                         help="Co-Located tab. The Standard tab compares the BESS-per-MVS scenarios chosen in Target Sizing.")
+    max_bess = st.slider("Max BESS per MVS", 1, 8, 4, 1)
 
     st.subheader("Commercial Equipment Scaling")
     bess_cap = st.slider("BESS Unit Capacity (MWh)", 0.0, 15.0, 5.0, 0.5)
@@ -135,9 +137,10 @@ def make_config(site_vertices, non_buildable, restricted, colocation=None):
 # ---------------------------------------------------------
 # TOP-LEVEL WORKFLOW TABS
 # ---------------------------------------------------------
-tab_standard, tab_colocated = st.tabs([
+tab_standard, tab_colocated, tab_target = st.tabs([
     "🏭 Standard Automated Design",
     "🔗 Industrial Co-Located Design",
+    "🎯 Target Sizing (extra)",
 ])
 
 with tab_standard:
@@ -151,29 +154,9 @@ with tab_standard:
             non_buildable_input = st.text_area("Non-Buildable Zones", value=DEFAULT_NONBUILD_ZONE, help="Areas reserved for access roads, environmental restrictions, or buffer corridors where no hardware can be placed.")
             restricted_input = st.text_area("Restricted / Out of Scope Zones", value=DEFAULT_RESTRICT_ZONE, help="Additional zones completely excluded from evaluation.")
 
-        with st.expander("🎯 Target Sizing", expanded=True):
-            st.markdown(
-                "Size the plant to an energy target with the BESS unit capacity from the sidebar. "
-                "Each BESS-per-MVS scenario places exactly the BESS needed with the fewest MVS, as a "
-                "compact block with minimum cable; if the target does not fit, it shows the maximum "
-                "that does."
-            )
-            tcol1, tcol2 = st.columns(2)
-            target_mwh = tcol1.number_input(
-                "Target Energy (MWh) — 0 = fill the site", min_value=0.0,
-                value=float(st.session_state.get("target_mwh", 0.0)), step=10.0)
-            ratios = tcol2.multiselect(
-                "BESS per MVS scenarios", options=list(range(1, 9)),
-                default=st.session_state.get("ratios", [4, 3, 2]))
-            if target_mwh > 0 and bess_cap > 0:
-                st.caption(f"{target_mwh:g} MWh ÷ {bess_cap:g} MWh/BESS → "
-                           f"**{-(-target_mwh // bess_cap):.0f} BESS**")
-
         st.session_state["site_input"] = site_input
         st.session_state["non_buildable_input"] = non_buildable_input
         st.session_state["restricted_input"] = restricted_input
-        st.session_state["target_mwh"] = target_mwh
-        st.session_state["ratios"] = sorted(ratios, reverse=True) or [max_bess]
 
         st.markdown("---")
         _, center_col, _ = st.columns([1, 2, 1])
@@ -207,48 +190,43 @@ with tab_standard:
             st.session_state["phase"] = 1
             st.rerun()
 
-        target_mwh = st.session_state.get("target_mwh", 0.0)
-        ratios = st.session_state.get("ratios", [max_bess])
-
-        state_str = f"{st.session_state['site_input']}|{st.session_state['non_buildable_input']}|{st.session_state['restricted_input']}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{bess_cap}|{target_mwh}|{ratios}"
+        state_str = f"{st.session_state['site_input']}|{st.session_state['non_buildable_input']}|{st.session_state['restricted_input']}|{b_front}|{b_back}|{b_left}|{b_right}|{m_front}|{m_back}|{m_left}|{m_right}|{max_bess}"
         cache_key = get_hash(state_str)
-        modes = [f"ratio_{r}" for r in ratios]
+        modes = ["row_pack"]
 
         if cache_key not in st.session_state["benchmark_results"]:
             st.session_state["benchmark_results"][cache_key] = {}
 
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
             try:
-                goal = f"{target_mwh:g} MWh target" if target_mwh > 0 else "maximum fill"
-                with st.spinner(f"Calculating Row Pack layouts ({goal}, {', '.join(map(str, ratios))} BESS/MVS)..."):
-                    out = run_target_packing(CONFIG, target_mwh, ratios=ratios)
-                for r, res in out.items():
-                    st.session_state["benchmark_results"][cache_key][f"ratio_{r}"] = {
+                for i, mode in enumerate(modes):
+                    status_text.text("Calculating Row Pack layout (back-to-back)...")
+                    res = run_row_packing(CONFIG, verbose=False)
+                    st.session_state["benchmark_results"][cache_key][mode] = {
                         "df": engine_to_df(res["mvs_list"], res["bess_list"]),
                         "metrics": res["metrics"],
-                        "target": res["target"],
-                        "ratio": r,
                     }
+                    progress_bar.progress((i + 1) / len(modes))
             except Exception as e:
                 del st.session_state["benchmark_results"][cache_key]
+                status_text.empty()
+                progress_bar.empty()
                 st.error(f"Optimization failed (check the site geometry): {e}")
                 st.stop()
+
+            status_text.empty()
+            progress_bar.empty()
 
         results = st.session_state["benchmark_results"][cache_key]
         cols = st.columns(len(modes))
 
         for i, mode in enumerate(modes):
             with cols[i]:
-                st.markdown(f"### {results[mode]['ratio']} BESS / MVS")
+                st.markdown(f"### {mode.replace('_', ' ').title()}")
                 metrics = results[mode]["metrics"]
-                tgt = results[mode]["target"]
                 sizing = size_system(metrics["bess_count"], metrics["mvs_count"], bess_cap, mvs_pow)
-
-                if target_mwh > 0:
-                    if tgt["met"]:
-                        st.success(f"✅ {target_mwh:g} MWh fits ({tgt['target_bess']} BESS)")
-                    else:
-                        st.warning(f"⚠️ Only {tgt['max_mwh']:.1f} MWh fits — "
-                                   f"{tgt['shortfall_mwh']:.1f} MWh short. Showing max layout.")
 
                 st.metric("Total BESS", metrics["bess_count"])
                 st.metric("Total MVS", metrics["mvs_count"])
@@ -261,9 +239,8 @@ with tab_standard:
                 if metrics.get("dropped_bess"):
                     st.warning(f"{metrics['dropped_bess']} BESS unassigned (cable cap).")
 
-                if st.button(f"🔎 Select {results[mode]['ratio']} BESS/MVS", key=f"select_{mode}", use_container_width=True):
+                if st.button(f"🔎 Select {mode.replace('_', ' ').title()}", key=f"select_{mode}", use_container_width=True):
                     st.session_state["active_mode"] = mode
-                    st.session_state["active_ratio"] = results[mode]["ratio"]
                     st.session_state["editor_df"] = results[mode]["df"].copy()
                     st.session_state["phase"] = 3
                     st.session_state["selected_id"] = None
@@ -273,8 +250,7 @@ with tab_standard:
     # PHASE 3: DEEP-DIVE & QUICK ADJUSTMENTS
     # ---------------------------------------------------------
     if st.session_state["phase"] == 3:
-        active_ratio = st.session_state.get("active_ratio", max_bess)
-        mode_title = f"Row Pack — {active_ratio} BESS/MVS"
+        mode_title = st.session_state["active_mode"].replace('_', ' ').title()
 
         col_back, col_title = st.columns([1, 10])
         with col_back:
@@ -300,7 +276,7 @@ with tab_standard:
 
             plotly_config = {
                 'scrollZoom': True,
-                'toImageButtonOptions': {'format': 'png', 'filename': f'bess_layout_{st.session_state["active_mode"]}', 'height': 1080, 'width': 1920}
+                'toImageButtonOptions': {'format': 'png', 'filename': f'bess_layout_{mode_title}', 'height': 1080, 'width': 1920}
             }
 
             event = st.plotly_chart(fig, use_container_width=True, on_select="rerun", selection_mode="points", config=plotly_config)
@@ -312,7 +288,7 @@ with tab_standard:
                     st.rerun()
 
         with col_data:
-            metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, active_ratio)
+            metrics = compute_metrics(site, non_buildable, mvs_list, bess_list, CONFIG["max_bess_per_mvs"])
             sizing = size_system(metrics["bess_count"], metrics["mvs_count"], bess_cap, mvs_pow)
 
             kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
@@ -585,3 +561,121 @@ with tab_colocated:
             )
     else:
         st.info("Configure the hub parameters above and run the optimization to generate the co-located layout.")
+
+
+# =========================================================
+# TARGET SIZING TAB (extra) — fit an energy target at a chosen duration
+# =========================================================
+with tab_target:
+    st.markdown("## 🎯 Target Sizing")
+    st.caption(
+        "Optional study on top of the main design (which maximises the number of BESS). "
+        "Set an energy target and the system duration(s): the duration fixes the plant power, "
+        "hence the number of MVS (MW ÷ MVS power); BESS = MWh ÷ BESS capacity, split evenly "
+        "across the MVS. The engine keeps the most compact, minimum-cable block; if the target "
+        "does not fit, it shows the largest plant that fits at that same duration."
+    )
+
+    with st.expander("Site & Target", expanded=True):
+        t_site_input = st.text_area(
+            "Global Property Boundary",
+            value=st.session_state.get("site_input", DEFAULT_SITE_VERTICES),
+            key="tg_site_input",
+        )
+        t_nb_input = st.text_area(
+            "Non-Buildable Zones",
+            value=st.session_state.get("non_buildable_input", DEFAULT_NONBUILD_ZONE),
+            key="tg_nb_input",
+        )
+        t_r_input = st.text_area(
+            "Restricted / Out of Scope Zones",
+            value=st.session_state.get("restricted_input", DEFAULT_RESTRICT_ZONE),
+            key="tg_r_input",
+        )
+        tc1, tc2 = st.columns(2)
+        target_mwh = tc1.number_input("Target Energy (MWh)", min_value=1.0, value=200.0, step=10.0)
+        durations = tc2.multiselect("System Duration (h)", options=[1, 2, 3, 4, 6, 8], default=[4],
+                                    help="Pick one or several to compare.")
+        if bess_cap > 0 and mvs_pow > 0:
+            n_b = -(-target_mwh // bess_cap)
+            for h in sorted(durations, reverse=True):
+                n_m = max(1, -(-(n_b * bess_cap / h) // mvs_pow))
+                st.caption(f"**{h}H** → {n_b:.0f} BESS ({n_b * bess_cap:.1f} MWh) on "
+                           f"{n_m:.0f} MVS ({n_m * mvs_pow:.1f} MW) ≈ {n_b / n_m:.1f} BESS/MVS")
+
+    run_tg = st.button("🎯 Run Target Sizing", type="primary", use_container_width=True,
+                       disabled=not durations)
+
+    if run_tg:
+        try:
+            TG_CONFIG = make_config(ast.literal_eval(t_site_input),
+                                    parse_zone(t_nb_input), parse_zone(t_r_input))
+        except Exception as e:
+            st.error(f"Error parsing coordinates: {e}")
+            st.stop()
+        try:
+            with st.spinner("Sizing the plant for each duration..."):
+                st.session_state["target_results"] = run_target_packing(
+                    TG_CONFIG, target_mwh, durations=sorted(durations, reverse=True))
+            st.session_state["target_config"] = TG_CONFIG
+        except Exception as e:
+            st.error(f"Target sizing failed (check the site geometry): {e}")
+            st.stop()
+
+    if st.session_state["target_results"]:
+        tg_results = st.session_state["target_results"]
+        TG_CONFIG = st.session_state["target_config"]
+
+        cols = st.columns(len(tg_results))
+        for col, (h, res) in zip(cols, tg_results.items()):
+            t, m = res["target"], res["metrics"]
+            with col:
+                st.markdown(f"### {h}H")
+                if t["met"]:
+                    st.success(f"✅ {t['target_mwh']:g} MWh fits")
+                else:
+                    st.warning(f"⚠️ Max {t['achieved_mwh']:.1f} MWh fits at {h}H — "
+                               f"{t['shortfall_mwh']:.1f} MWh short")
+                st.metric("BESS / MVS", f"{t['achieved_bess']} / {t['achieved_mvs']}")
+                st.metric("Plant Energy", f"{t['achieved_mwh']:.1f} MWh")
+                st.metric("Plant Power", f"{t['achieved_mw']:.1f} MW")
+                st.metric("Real Duration", f"{t['achieved_duration_h']:.2f} h")
+                st.metric("Max BESS per MVS", t["bess_per_mvs"])
+                st.metric("Total Cable", f"{m['total_cable']:.1f} m")
+
+        pick = st.radio("Layout to display", list(tg_results), horizontal=True,
+                        format_func=lambda h: f"{h}H")
+        res = tg_results[pick]
+        fig = plot_layout_plotly(res["site"], res["non_buildable"], res["mvs_list"],
+                                 res["bess_list"], TG_CONFIG,
+                                 title=f"Target Sizing — {res['target']['target_mwh']:g} MWh @ {pick}H",
+                                 restricted=res.get("restricted", ()))
+        fig.update_layout(dragmode='pan')
+        st.plotly_chart(fig, use_container_width=True, config={
+            'scrollZoom': True,
+            'toImageButtonOptions': {'format': 'png', 'filename': f'bess_target_{pick}H',
+                                     'height': 1080, 'width': 1920},
+        })
+
+        t = res["target"]
+        tg_df = engine_to_df(res["mvs_list"], res["bess_list"])
+        tg_df.loc[tg_df["Type"] == "BESS", "Capacity (MWh)"] = bess_cap
+        tg_df.loc[tg_df["Type"] == "MVS", "Capacity (MWh)"] = 0.0
+        tg_df.loc[tg_df["Type"] == "MVS", "Power (MW)"] = mvs_pow
+        tg_df.loc[tg_df["Type"] == "BESS", "Power (MW)"] = 0.0
+        st.download_button(
+            label=f"📥 Download {pick}H Engineering Report (CSV)",
+            data=layout_to_csv(tg_df, summary={
+                "Target Energy (MWh)": f"{t['target_mwh']:g}",
+                "System Duration": f"{pick}H",
+                "Total Plant Power (MW)": f"{t['achieved_mw']:.1f}",
+                "Total Plant Energy (MWh)": f"{t['achieved_mwh']:.1f}",
+                "Real Duration (h)": f"{t['achieved_duration_h']:.2f}",
+                "Target Met": "Yes" if t["met"] else "No",
+            }).encode('utf-8'),
+            file_name=f'bess_boq_target_{pick}H.csv',
+            mime='text/csv',
+            use_container_width=True,
+        )
+    else:
+        st.info("Set the target and duration(s) above and run the sizing.")

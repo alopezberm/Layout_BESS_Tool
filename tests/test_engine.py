@@ -107,25 +107,26 @@ def test_row_packing_backtoback():
 
 
 def test_target_packing_exact_and_shortfall():
-    # 100 MWh / 5 MWh = 20 BESS: each ratio must place exactly 20 BESS on the
-    # minimum number of MVS, all valid.
+    # 100 MWh with 5 MWh BESS and 2.5 MW MVS: 20 BESS; the duration fixes the
+    # power -> 4H = 25 MW = 10 MVS, 2H = 50 MW = 20 MVS. Exact, balanced, valid.
     config = make_config()
-    out = run_target_packing(config, 100, ratios=[4, 3, 2])
-    for ratio, res in out.items():
-        t = res["target"]
-        assert t["met"] and t["target_bess"] == 20
-        assert res["metrics"]["bess_count"] == 20
-        assert res["metrics"]["mvs_count"] == -(-20 // ratio)
+    out = run_target_packing(config, 100, durations=[4, 2])
+    for h, n_mvs in ((4, 10), (2, 20)):
+        res, t = out[h], out[h]["target"]
+        assert t["met"] and t["achieved_bess"] == 20 and t["achieved_mvs"] == n_mvs
+        assert res["metrics"]["bess_count"] == 20 and res["metrics"]["mvs_count"] == n_mvs
+        assert abs(t["achieved_duration_h"] - h) < 1e-9
+        fills = [len(m["assigned_bess"]) for m in res["mvs_list"]]
+        assert max(fills) - min(fills) <= 1, "BESS not split evenly across MVS"
         _assert_no_overlaps(res)
-        _assert_capacity(res, ratio)
         _assert_inside_site(res)
         assert res["metrics"]["max_cable_used"] <= config["max_cable_length"] + 1e-6
 
-    # An unreachable target falls back to the maximum layout and flags it.
-    res = run_target_packing(config, 10_000, ratios=[4])[4]
-    t = res["target"]
-    assert not t["met"] and t["shortfall_mwh"] > 0
-    assert res["metrics"]["bess_count"] == t["max_bess"]
+    # An unreachable target returns the largest plant at the SAME duration.
+    t = run_target_packing(config, 10_000, durations=[4])[4]["target"]
+    assert not t["met"] and t["shortfall_mwh"] > 0 and t["achieved_bess"] > 0
+    assert t["achieved_duration_h"] >= 4 - 1e-9
+    assert t["achieved_mvs"] == -(-t["achieved_bess"] * 5.0 // (4 * 2.5))
 
 
 def test_site_file_roundtrip(tmp_path=None):
